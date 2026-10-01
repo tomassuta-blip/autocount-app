@@ -282,7 +282,7 @@ st.markdown("""
 <style>
     @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
     /* Reset & General Setup */
-    .block-container { padding-top: 1.5rem !important; padding-bottom: 1rem !important; max-width: 96%; }
+    .block-container { padding-top: 3.2rem !important; padding-bottom: 1rem !important; max-width: 96%; }
     html, body, [class*="css"] { font-size: 0.75rem !important; font-family: 'Inter', -apple-system, sans-serif; }
     
     /* Top Bar Styling */
@@ -323,8 +323,11 @@ st.markdown("""
 
     /* ===================== TEMA CRM ===================== */
     .stApp { background-color: #f5f7fb; }
-    #MainMenu, footer, .stDeployButton, [data-testid="stToolbar"], [data-testid="stDecoration"] { display: none !important; visibility: hidden !important; }
-    header[data-testid="stHeader"] { background: transparent; }
+    #MainMenu, footer, .stDeployButton, [data-testid="stAppDeployButton"], [data-testid="stMainMenu"], [data-testid="stDecoration"] { display: none !important; }
+    header[data-testid="stHeader"] { background: transparent !important; }
+    /* Botón para abrir el menú lateral: siempre visible y con buen contraste (no se oculta la barra superior de Streamlit) */
+    [data-testid="stSidebarCollapsedControl"] button, [data-testid="stExpandSidebarButton"], [data-testid="collapsedControl"] button { background: #0f172a !important; border-radius: 10px !important; box-shadow: 0 4px 10px -2px rgba(15,23,42,.35) !important; }
+    [data-testid="stSidebarCollapsedControl"] *, [data-testid="stExpandSidebarButton"] *, [data-testid="collapsedControl"] * { color: #ffffff !important; fill: #ffffff !important; }
     .page-title { font-size: 1.3rem; font-weight: 800; color: #0f172a; letter-spacing: -0.4px; padding: 2px 0 10px 0; margin-bottom: 8px; border-bottom: 2px solid #e2e8f0; }
     .block-container h4, .block-container h5 { font-weight: 800; color: #1e293b; letter-spacing: -0.2px; }
 
