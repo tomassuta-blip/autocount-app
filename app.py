@@ -356,7 +356,8 @@ st.markdown("""
     /* Tarjetas KPI */
     [data-testid="stMetric"] { background: #ffffff; border: 1px solid #e2e8f0; border-left: 4px solid #38bdf8; border-radius: 10px; padding: 10px 14px; box-shadow: 0 1px 2px rgba(15,23,42,.05); }
     [data-testid="stMetricLabel"] p { color: #64748b !important; font-weight: 700 !important; text-transform: uppercase; letter-spacing: .4px; font-size: .65rem !important; }
-    [data-testid="stMetricValue"] { color: #0f172a; font-weight: 800; }
+    [data-testid="stMetricValue"] { color: #0f172a; font-weight: 800; font-size: 1.25rem !important; line-height: 1.25; }
+    [data-testid="stMetricValue"] div { overflow: visible !important; text-overflow: clip !important; white-space: nowrap; }
 
     /* Pestañas */
     .stTabs [data-baseweb="tab-list"] { gap: 6px; border-bottom: 1px solid #e2e8f0; }
@@ -1758,7 +1759,7 @@ elif panel_seleccionado == "📥 1. Recepción & Aprobación":
                             else:
                                 st.markdown("<span class='badge-warn'>🔴 Tercero No Creado</span>", unsafe_allow_html=True)
                                 if can_approve and st.button("➕ Crear en Siigo", key=f"btn_crea_t_fc_{idx_doc}"): modal_formulario_tercero(clean_nit, r['Proveedor'], curr_tenant_nit, curr_tenant['siigo_user'], curr_tenant['siigo_key'], es_extranjero=False)
-                        with c3: st.metric("Total a Pagar", f"${r['Total']:,.2f} COP")
+                        with c3: st.metric("Total a Pagar (COP)", f"${r['Total']:,.2f}")
                         with c4:
                             if can_approve:
                                 sel_cc = st.selectbox("Centro de Costo", options=cc_opciones, index=cc_opciones.index(r.get("CentroCosto")) if r.get("CentroCosto") in cc_opciones else 0, key=f"fc_cc_{idx_doc}", label_visibility="collapsed")
@@ -2470,7 +2471,7 @@ elif panel_seleccionado == "📦 5. Caja Menor":
                 c1, c2, c3, c4 = st.columns([2, 4, 2, 2])
                 with c1: st.markdown(f"### {tipo_txt}-{ref}\n**{fecha}**")
                 with c2: st.markdown(f"#### {prov}\n<span class='badge-caja'>📦 Caja Menor</span>", unsafe_allow_html=True)
-                with c3: st.metric("Total Gasto", f"${total:,.2f} COP")
+                with c3: st.metric("Total Gasto (COP)", f"${total:,.2f}")
                 with c4:
                     if d.get("pdf_b64"): st.download_button("💾 Ver PDF", data=safe_b64decode(d["pdf_b64"]), file_name=f"CajaMenor_{ref}.pdf", mime="application/pdf", key=f"dl_caja_pdf_{llave_caja}", use_container_width=True)
                     if can_approve and st.button("🔄 A Pendientes", key=f"btn_return_caja_{llave_caja}", use_container_width=True):
