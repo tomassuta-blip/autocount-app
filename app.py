@@ -404,8 +404,8 @@ def conciliar_dian(tenant_nit, dian):
         lugares, por_folio = idx.get((nit, clave)), False
         if not lugares and r["folio_num"] and r["folio_num"] != clave:
             lugares = idx.get((nit, r["folio_num"])); por_folio = bool(lugares)
-        base = {"Fecha emisión": r["fecha"], "Tipo": r["tipo"], "Documento": r["numero"], "NIT emisor": nit, "Proveedor": r["proveedor"], "Total DIAN": r["total_num"],
-                "Estado DIAN": r["estado"], "Recibido": str(r["fecha_recepcion"])[:16].replace("T", " "), "CUFE/CUDE": str(r["cufe"]).strip()}
+        base = {"Fecha emisión": r["fecha"], "Tipo": r["tipo"], "Documento": r["numero"], "CUFE/CUDE": str(r["cufe"]).strip(), "NIT emisor": nit, "Proveedor": r["proveedor"], "Total DIAN": r["total_num"],
+                "Estado DIAN": r["estado"], "Recibido": str(r["fecha_recepcion"])[:16].replace("T", " ")}
         if not lugares: faltan.append(base); continue
         estan.append({**base, "Dónde está en la app": " + ".join(dict.fromkeys(lugares)) + (" (coincidencia solo por folio)" if por_folio else "")})
         k = (nit, r["folio_num"] if por_folio else clave)
@@ -3173,7 +3173,7 @@ elif panel_seleccionado == "🏛️ Conciliación DIAN":
     if not puede_conciliar_dian: st.warning("🔒 Acceso denegado.")
     else:
         page_title("🏛️ Conciliación con el reporte de la DIAN")
-        st.caption("Sube el Excel de documentos recibidos que bajas de la DIAN con tu token. La app lo cruza con lo que ya tiene (bandeja, causadas y tesorería) y te dice qué documentos faltan. **Solo lee: no carga, no modifica ni borra nada.** Las filas «Application response» (acuses de la DIAN) se ignoran.")
+        st.caption("Sube el Excel de documentos recibidos que bajas de la DIAN con tu token. La app lo cruza con lo que ya tiene (bandeja, causadas y tesorería) y te dice qué documentos faltan. **La conciliación solo lee: no carga, no modifica ni borra nada.** Solo si subes los ZIP o XML que bajes de la DIAN y confirmas, se cargan a la bandeja. Las filas «Application response» (acuses de la DIAN) se ignoran.")
         up_dian = st.file_uploader("Reporte de la DIAN (Excel .xlsx)", type=["xlsx"], key="up_dian")
         if up_dian is not None:
             llave_dian = f"{curr_tenant_nit}_{up_dian.name}_{up_dian.size}"
@@ -3194,25 +3194,43 @@ elif panel_seleccionado == "🏛️ Conciliación DIAN":
                     cd = st.session_state.get("conc_dian")
                     if cd and cd["llave"] == llave_dian:
                         res = cd["res"]
+                        if st.session_state.get("dian_carga_msg"): st.success(st.session_state.pop("dian_carga_msg"))
                         r1, r2, r3, r4 = st.columns(4)
                         r1.metric("❌ Faltan en la app", len(res["faltan"])); r2.metric("✅ Ya están", len(res["estan"])); r3.metric("⚖️ Diferencias de valor", len(res["diferencias"])); r4.metric("🔎 En la app, no en el reporte", len(res["solo_app"]))
                         if len(res["faltan"]) == 0: st.success("🎉 Todo lo que la DIAN reporta ya está en la app.")
                         st.download_button("📥 Descargar la conciliación (Excel)", data=excel_conciliacion(res), file_name=f"Conciliacion_DIAN_{curr_tenant_nit}.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
                         t_f, t_e, t_d, t_s = st.tabs([f"❌ Faltan en la app ({len(res['faltan'])})", f"✅ Ya están ({len(res['estan'])})", f"⚖️ Diferencias de valor ({len(res['diferencias'])})", f"🔎 En la app, no en el reporte ({len(res['solo_app'])})"])
                         with t_f:
-                            st.caption("Documentos que la DIAN dice que recibiste y que NO están en la app (ni en bandeja, ni causados, ni en tesorería). Pide el XML al proveedor o búscalo en el correo.")
+                            st.caption("Documentos que la DIAN dice que recibiste y que NO están en la app (ni en bandeja, ni causados, ni en tesorería). Copia el CUFE de la tabla (clic en la celda y Cmd/Ctrl + C), descarga el ZIP en la DIAN y súbelo aquí abajo.")
                             if len(res["faltan"]):
-                                st.dataframe(res["faltan"], use_container_width=True, hide_index=True)
-                                cufes_f = [(r["Documento"], str(r["Proveedor"]), float(r["Total DIAN"] or 0), str(r["CUFE/CUDE"]).strip()) for r in res["faltan"].to_dict("records") if str(r.get("CUFE/CUDE", "")).strip()]
-                                if cufes_f:
-                                    with st.expander("📋 Copiar los CUFE para descargar el ZIP en la DIAN", expanded=True):
-                                        st.caption(f"Todos los CUFE, uno por línea (usa el ícono de copiar de la esquina del recuadro). Si la DIAN pide una identificación al buscar, usa el NIT de la empresa: {curr_tenant_nit}.")
-                                        st.code("\n".join(c[3] for c in cufes_f), language=None)
-                                        for doc_f, prov_f, tot_f, cufe_f in cufes_f[:100]:
-                                            cf1, cf2 = st.columns([2, 5])
-                                            cf1.markdown(f"**{doc_f}**  \n{prov_f[:34]}  \n${tot_f:,.0f}  \n[🔗 Abrir en la DIAN](https://catalogo-vpfe.dian.gov.co/document/searchqr?documentkey={cufe_f})")
-                                            cf2.code(cufe_f, language=None)
-                                        if len(cufes_f) > 100: st.caption(f"Se muestran 100 de {len(cufes_f)}; los demás están en la tabla y en el Excel.")
+                                st.dataframe(res["faltan"], use_container_width=True, hide_index=True, column_config={"CUFE/CUDE": st.column_config.TextColumn("CUFE/CUDE", width="large", help="Clic en la celda y copia con Cmd/Ctrl + C")})
+                                st.markdown("##### 📥 Subir los ZIP o XML descargados de la DIAN")
+                                st.caption("Arrastra aquí los archivos que vayas bajando. La app te dice cuáles de los que faltan ya llegaron y, cuando tú confirmes, los pone en la bandeja de Recepción para procesar. Nada se carga hasta que pulses el botón.")
+                                up_z = st.file_uploader("ZIP o XML descargados de la DIAN", type=["zip", "xml"], accept_multiple_files=True, key=f"up_dian_zips_{st.session_state.get('dian_zip_key', 0)}")
+                                if up_z:
+                                    items_z, filas_z, sin_leer, nuevos_z = [], [], [], []
+                                    for fz in up_z:
+                                        n0_z = len(items_z); process_bytes(fz.name, fz.getvalue(), items_z, tenant_nit=curr_tenant_nit)
+                                        if len(items_z) == n0_z: sin_leer.append(fz.name)
+                                    hist_z, docs_z = db_ids_ya_procesados(curr_tenant_nit)
+                                    faltan_k = {(re.sub(r"\D", "", str(r["NIT emisor"])), re.sub(r"\D", "", str(r["Documento"]))) for r in res["faltan"].to_dict("records")}
+                                    for it_z in items_z:
+                                        rr_z = it_z["Resumen"]; nit_z, ref_z = re.sub(r"\D", "", str(rr_z["NIT"])), str(rr_z["ID"])
+                                        id_z = f"{curr_tenant_nit}_FC_{nit_z}_{ref_z}"
+                                        if id_z in hist_z or docs_z.get(id_z): est_z = "♻️ Ya estaba en la app (se omite)"
+                                        elif (nit_z, re.sub(r"\D", "", ref_z)) in faltan_k: est_z = "✅ Era de los que faltaban"; nuevos_z.append(it_z)
+                                        else: est_z = "➕ Nuevo (no estaba en el reporte)"; nuevos_z.append(it_z)
+                                        filas_z.append({"Estado": est_z, "Documento": ref_z, "Proveedor": rr_z.get("Proveedor", ""), "NIT": nit_z, "Fecha": rr_z.get("Fecha", ""), "Total": rr_z.get("Total", 0)})
+                                    if filas_z: st.dataframe(pd.DataFrame(filas_z), use_container_width=True, hide_index=True)
+                                    if sin_leer: st.warning("No se encontró ninguna factura en: " + ", ".join(sin_leer) + ". Pueden ser acuses de la DIAN u otro tipo de archivo.")
+                                    if nuevos_z:
+                                        if can_upload:
+                                            if st.button(f"➕ Cargar {len(nuevos_z)} documento(s) a la bandeja para procesar", type="primary", key="btn_dian_cargar"):
+                                                r_z = guardar_lote_recepcion(curr_tenant_nit, nuevos_z, "FC", False, None, None)
+                                                cd["res"] = conciliar_dian(curr_tenant_nit, dian_df)
+                                                st.session_state["dian_carga_msg"] = f"✅ Se cargaron {r_z['added']} documento(s) a la bandeja de Recepción para procesar." + (f" {len(r_z['skipped'])} ya estaban registrados." if r_z["skipped"] else "")
+                                                st.session_state["dian_zip_key"] = st.session_state.get("dian_zip_key", 0) + 1; st.rerun()
+                                        else: st.info("Tu rol puede ver la comparación pero no cargar documentos a la bandeja. Pídele a un Administrador que los cargue.")
                         with t_e: 
                             if len(res["estan"]): st.dataframe(res["estan"], use_container_width=True, hide_index=True)
                         with t_d:
