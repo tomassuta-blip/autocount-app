@@ -719,14 +719,22 @@ _DDL_TABLAS = [
     'CREATE TABLE IF NOT EXISTS treasury (id TEXT PRIMARY KEY, tenant_nit TEXT, doc_ref TEXT, proveedor TEXT, nit_proveedor TEXT, fecha_recibido TEXT, fecha_vencimiento TEXT, concepto TEXT, centro_costo TEXT, valor_con_iva REAL, total_pagar REAL, estado TEXT, clasificacion TEXT, fecha_propuesta TEXT, observacion TEXT, fecha_pago TEXT, banco_girador TEXT, raw_data TEXT)',
 ]
 
+# Cambios de esquema para bases YA existentes (se aplican una sola vez; si la columna ya existe no pasa nada).
+# AL AGREGAR UNA COLUMNA NUEVA: sumar aquí su ALTER TABLE. La huella de abajo cambia sola y el arranque se repite en el próximo despliegue.
+_MIGRACIONES = [
+    "ALTER TABLE users ADD COLUMN activo INTEGER DEFAULT 1",      # gestión de usuarios
+    "ALTER TABLE treasury ADD COLUMN raw_data TEXT",
+]
+_VERSION_ESQUEMA = hashlib.md5(json.dumps([_DDL_TABLAS, _MIGRACIONES]).encode("utf-8")).hexdigest()[:12]
+
 def init_db():
     conn = get_db_connection()
     c = conn.cursor()
     for _ddl in _DDL_TABLAS: c.execute(_ddl)
-    try: c.execute("ALTER TABLE users ADD COLUMN activo INTEGER DEFAULT 1")   # bases creadas antes de la gestión de usuarios
-    except Exception: pass
-    try: c.execute('ALTER TABLE treasury ADD COLUMN raw_data TEXT')
-    except: pass
+    conn.commit()
+    for _m in _MIGRACIONES:
+        try: c.execute(_m); conn.commit()
+        except Exception: conn.rollback()   # ya existía la columna
     
     c.execute("SELECT COUNT(*) FROM users")
     if c.fetchone()[0] == 0:
@@ -737,11 +745,12 @@ def init_db():
     conn.close()
 
 @st.cache_resource(show_spinner=False)
-def _init_db_cached():
+def _init_db_cached(version_esquema):
+    """Se ejecuta una vez por servidor Y por versión del esquema: así, al subir código con columnas nuevas, la migración corre sin reiniciar."""
     init_db()
     return True
 
-_init_db_cached()
+_init_db_cached(_VERSION_ESQUEMA)
 
 def db_is_doc_already_processed(tenant_nit, doc_ref, tipo, nit_prov):
     conn = get_db_connection()
