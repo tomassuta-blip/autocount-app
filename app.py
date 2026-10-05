@@ -10,7 +10,7 @@ import xml.etree.ElementTree as ET
 import pandas as pd
 import requests
 import streamlit as st
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Dict, List, Any
 from pypdf import PdfReader
 from fpdf import FPDF
@@ -232,6 +232,47 @@ def fecha_en_rango(fecha_str, usar_rango, desde, hasta):
     except Exception: return True
     return desde <= f <= hasta
 
+def _params_rango_drive(usar_rango, desde, hasta):
+    """Rango que se le avisa al script de Drive (si el script lo entiende, solo devuelve esos archivos; si no, lo ignora)."""
+    return {"desde": str(desde), "hasta": str(hasta)} if (usar_rango and desde and hasta) else None
+
+def archivo_drive_fuera_de_rango(item, desde, margen_dias=3):
+    """True si el script informó la fecha del archivo (campo opcional 'fecha') y es ANTERIOR al inicio del rango menos un margen.
+    Solo hay cota inferior: un documento puede subirse a Drive días después de emitido."""
+    for k in ("fecha", "created", "creado", "fechaCreacion", "modificado", "modified"):
+        v = item.get(k)
+        if v:
+            try: return datetime.strptime(str(v)[:10], "%Y-%m-%d").date() < desde - timedelta(days=margen_dias)
+            except Exception: continue
+    return False
+
+_PATRON_ISSUEDATE = re.compile(rb'<(?:[A-Za-z0-9_]+:)?IssueDate>\s*(\d{4}-\d{2}-\d{2})')
+
+def fecha_emision_rapida(nombre, datos):
+    """(fecha mínima, fecha máxima) de emisión de un XML o ZIP, leyendo solo la primera <IssueDate> de cada XML (sin interpretarlo completo).
+    Usa la PRIMERA aparición, que es la del encabezado: las notas crédito citan después facturas más antiguas. None si no se puede."""
+    try:
+        n = str(nombre).lower(); fechas = []
+        if n.endswith(".xml"):
+            m = _PATRON_ISSUEDATE.search(datos[:20000]); fechas = [m.group(1).decode()] if m else []
+        elif n.endswith(".zip"):
+            with zipfile.ZipFile(io.BytesIO(datos)) as z:
+                for f in z.namelist():
+                    if f.lower().endswith(".xml"):
+                        with z.open(f) as fh: m = _PATRON_ISSUEDATE.search(fh.read(20000))
+                        if m: fechas.append(m.group(1).decode())
+        return (min(fechas), max(fechas)) if fechas else None
+    except Exception: return None
+
+def db_ids_ya_procesados(tenant_nit):
+    """Un solo viaje a la base: ids ya causados (historial) y {id: estado} de lo ya registrado en la bandeja."""
+    conn = get_db_connection(); c = conn.cursor()
+    try:
+        c.execute("SELECT id FROM history WHERE tenant_nit=?", (tenant_nit,)); hist = {r[0] for r in c.fetchall()}
+        c.execute("SELECT id, estado FROM docs WHERE tenant_nit=?", (tenant_nit,)); docs = {r[0]: r[1] for r in c.fetchall()}
+    finally: conn.close()
+    return hist, docs
+
 def _campos_doc(item, tipo):
     """(doc_ref, nit, fecha, proveedor, total) de una factura FC o un documento soporte DS."""
     if tipo == "FC":
@@ -241,17 +282,22 @@ def _campos_doc(item, tipo):
 
 def guardar_lote_recepcion(tenant_nit, items, tipo, usar_rango, desde, hasta):
     """Guarda como 'Pendiente' lo nuevo y en rango. Lo que cae fuera del rango NO se descarta: se devuelve en 'fuera'."""
+    t0 = time.time()
     res = {"leidos": 0, "added": 0, "skipped": [], "fuera": []}
+    hist_ids, docs_ids = db_ids_ya_procesados(tenant_nit)       # una sola consulta (antes eran 2 por documento)
     for item in items:
         if not item: continue
         res["leidos"] += 1
         doc_ref, nit_prov, fecha, prov, _ = _campos_doc(item, tipo)
         if not fecha_en_rango(fecha, usar_rango, desde, hasta):
             res["fuera"].append(item); continue
-        is_proc, razon = db_is_doc_already_processed(tenant_nit, doc_ref, tipo, nit_prov)
-        if not is_proc:
-            db_save_doc(tenant_nit, doc_ref, tipo, "Pendiente", item, nit_prov); res["added"] += 1
-        else: res["skipped"].append(f"{tipo}-{doc_ref} ({prov}): {razon}")
+        nit_limpio = re.sub(r'\D', '', str(nit_prov))
+        doc_id = f"{tenant_nit}_{tipo}_{nit_limpio}_{doc_ref}"
+        if doc_id in hist_ids: res["skipped"].append(f"{tipo}-{doc_ref} ({prov}): ya fue causada en Siigo (Histórico)")
+        elif docs_ids.get(doc_id) in ("Aprobado", "Rechazado", "Pendiente", "Caja Menor"): res["skipped"].append(f"{tipo}-{doc_ref} ({prov}): ya está registrada en estado {docs_ids[doc_id]}")
+        else:
+            db_save_doc(tenant_nit, doc_ref, tipo, "Pendiente", item, nit_prov); res["added"] += 1; docs_ids[doc_id] = "Pendiente"
+    res["seg_guardado"] = round(time.time() - t0, 1)
     return res
 
 def mostrar_resultado_recepcion(tipo):
@@ -261,6 +307,9 @@ def mostrar_resultado_recepcion(tipo):
         res = st.session_state.pop(k_res)
         partes = [f"📬 Leídos: **{res.get('leidos', 0)}**", f"✅ Nuevos: **{res['added']}**",
                   f"♻️ Ya registrados: **{len(res['skipped'])}**", f"📅 Fuera de rango: **{res.get('n_fuera', 0)}**"]
+        if res.get("omitidos"): partes.append(f"⏭️ Omitidos por fecha, sin leer: **{res['omitidos']}**")
+        _t = {k: v for k, v in (res.get("tiempos") or {}).items() if v is not None}
+        if _t: partes.append("⏱ " + " · ".join(f"{k} {v} s" for k, v in _t.items()))
         if res.get("origen"): partes.insert(0, f"Origen: **{res['origen']}**")
         (st.success if res["added"] > 0 else st.warning)("  ·  ".join(partes))
         if res["skipped"]: st.warning("⚠️ **Ya estaban registrados:**\n" + "\n".join([f"* {i}" for i in res["skipped"]]))
@@ -1263,10 +1312,14 @@ def process_bytes(file_name, file_bytes, data_list, tenant_nit=None):
         parsed = parse_ubl_xml(file_bytes, tenant_nit=tenant_nit)
         if parsed: parsed["xml_b64"] = base64.b64encode(file_bytes).decode("utf-8"); data_list.append(parsed)
 
-def extraer_facturas_desde_drive_cloud(web_app_url, data_list, tenant_nit=None, stats=None):
-    """Lee los archivos del script de Drive. Igual que siempre, pero si se pasa `stats` deja un resumen de lo recibido."""
+def extraer_facturas_desde_drive_cloud(web_app_url, data_list, tenant_nit=None, stats=None, desde=None, hasta=None):
+    """Lee los archivos del script de Drive. Con rango (desde/hasta): se lo avisa al script y NO lee a fondo lo que está claramente fuera
+    (usa la fecha del archivo si el script la envía, y si no la fecha de emisión leída al vuelo). Un margen evita perder borde del rango;
+    el filtro exacto se aplica después, como siempre. Sin rango, se comporta como antes."""
     try:
-        res = requests.get(web_app_url, timeout=300)
+        t0 = time.time()
+        res = requests.get(web_app_url, params=_params_rango_drive(True, desde, hasta), timeout=300)
+        if stats is not None: stats["seg_descarga"] = round(time.time() - t0, 1)
         if res.status_code == 200:
             try: archivos = res.json()
             except Exception:
@@ -1279,11 +1332,22 @@ def extraer_facturas_desde_drive_cloud(web_app_url, data_list, tenant_nit=None, 
                     exts[ext] = exts.get(ext, 0) + 1
                 stats["detalle"] = ", ".join(f"{n} {e}" for e, n in exts.items())
             if not isinstance(archivos, list) or len(archivos) == 0: return True, "No se encontraron archivos."
+            t1, omitidos = time.time(), 0
+            lim_ini, lim_fin = ((desde - timedelta(days=7)).strftime("%Y-%m-%d"), (hasta + timedelta(days=7)).strftime("%Y-%m-%d")) if (desde and hasta) else (None, None)
             for item in archivos:
                 fname = item.get("filename", "factura.zip")
                 b64_str = item.get("base64", "")
-                if b64_str: process_bytes(fname, safe_b64decode(b64_str), data_list, tenant_nit=tenant_nit)
-            return True, f"Se leyeron {len(archivos)} archivo(s) desde Drive."
+                if not b64_str: continue
+                if desde and archivo_drive_fuera_de_rango(item, desde): omitidos += 1; continue
+                datos = safe_b64decode(b64_str)
+                if lim_ini:
+                    f_ = fecha_emision_rapida(fname, datos)
+                    if f_ and (f_[1] < lim_ini or f_[0] > lim_fin): omitidos += 1; continue
+                process_bytes(fname, datos, data_list, tenant_nit=tenant_nit)
+            if stats is not None: stats["omitidos_fecha"], stats["seg_lectura"] = omitidos, round(time.time() - t1, 1)
+            msg = f"Se leyeron {len(archivos) - omitidos} de {len(archivos)} archivo(s) desde Drive."
+            if omitidos: msg += f" {omitidos} fuera del rango de fechas se omitieron sin leerlos."
+            return True, msg
         else: return False, f"Error HTTP {res.status_code} al conectar con Drive."
     except Exception as e: return False, f"Error Drive: {e}"
 
@@ -1859,16 +1923,16 @@ elif panel_seleccionado == "📥 1. Recepción & Aprobación":
                     origen_fc = "Google Drive"
                     url_api = _secret("DRIVE_FC_URL", "https://script.google.com/macros/s/AKfycbyyujzRVc6JsE--ENDSDiAMyIDNKJbDxbUirpTBXnc3KJxNI6HJfU7dJT9di97UTuzK/exec")
                     with st.spinner("Consultando Google Drive Nube..."):
-                        exito_d, msg_d = extraer_facturas_desde_drive_cloud(url_api, data_list, tenant_nit=curr_tenant_nit, stats=stats_drive)
+                        exito_d, msg_d = extraer_facturas_desde_drive_cloud(url_api, data_list, tenant_nit=curr_tenant_nit, stats=stats_drive, desde=rango_desde_fc if usar_rango_fc else None, hasta=rango_hasta_fc if usar_rango_fc else None)
                         if not exito_d: st.error(msg_d)
                         else: st.info(msg_d)
-                    if exito_d and stats_drive.get("archivos", 0) > 0 and not data_list:
+                    if exito_d and stats_drive.get("archivos", 0) - stats_drive.get("omitidos_fecha", 0) > 0 and not data_list:
                         st.warning(f"Drive devolvió {stats_drive['archivos']} archivo(s) ({stats_drive.get('detalle', '')}) pero ninguno produjo una factura. Pueden ser eventos de la DIAN (acuses), facturas emitidas a otro NIT, o archivos que no son XML/ZIP.")
 
                 if data_list:
                     res_fc = guardar_lote_recepcion(curr_tenant_nit, data_list, "FC", usar_rango_fc, rango_desde_fc, rango_hasta_fc)
                     retener_fuera_de_rango("FC", res_fc["fuera"])
-                    st.session_state['result_upload_fc'] = {"added": res_fc["added"], "skipped": res_fc["skipped"], "leidos": res_fc["leidos"], "n_fuera": len(res_fc["fuera"]), "origen": origen_fc}
+                    st.session_state['result_upload_fc'] = {"added": res_fc["added"], "skipped": res_fc["skipped"], "leidos": res_fc["leidos"], "n_fuera": len(res_fc["fuera"]), "origen": origen_fc, "omitidos": stats_drive.get("omitidos_fecha", 0), "tiempos": {"descarga": stats_drive.get("seg_descarga"), "lectura": stats_drive.get("seg_lectura"), "guardado": res_fc.get("seg_guardado")}}
                     st.session_state['fc_up_key'] += 1; st.rerun()
 
                 mostrar_resultado_recepcion("FC")
@@ -1968,7 +2032,7 @@ elif panel_seleccionado == "📥 1. Recepción & Aprobación":
                 with c_btn_ds1: btn_manual_ds = st.button("🚀 Procesar Documentos (IA)", key="btn_proc_ds", type="primary", use_container_width=True)
                 with c_btn_ds2: btn_drive_ds = st.button("☁️ Sincronizar Google Drive (IA)", type="secondary", use_container_width=True)
                 
-                nuevos_ds, origen_ds = [], ""
+                nuevos_ds, origen_ds, omit_ds, seg_ds = [], "", 0, {}
                 if btn_manual_ds and uploaded_ds:
                     origen_ds = "Archivos subidos"
                     nuevos_ds = [extraer_datos_pdf_soporte(f.read(), f.name) for f in uploaded_ds]
@@ -1977,14 +2041,19 @@ elif panel_seleccionado == "📥 1. Recepción & Aprobación":
                     url_api = _secret("DRIVE_DS_URL", "https://script.google.com/macros/s/AKfycbwsbar6jmdHl8xUhwJqR8OZo0C4Xk4TveU4iYzU0VPdxUCB9_lUE-xivSm0mn6bhHTpZw/exec")
                     with st.spinner("Procesando PDFs con IA desde Drive..."):
                         try:
-                            res = requests.get(url_api, timeout=300)
+                            _t0 = time.time()
+                            res = requests.get(url_api, params=_params_rango_drive(usar_rango_ds, rango_desde_ds, rango_hasta_ds), timeout=300)
+                            seg_ds["descarga"] = round(time.time() - _t0, 1)
                             if res.status_code == 200:
                                 archivos = res.json()
                                 if isinstance(archivos, list) and len(archivos) > 0:
+                                    _t1 = time.time()
                                     for item in archivos:
                                         fname, b64_str = item.get("filename", "documento.pdf"), item.get("base64", "")
+                                        if usar_rango_ds and archivo_drive_fuera_de_rango(item, rango_desde_ds): omit_ds += 1; continue
                                         if b64_str and fname.lower().endswith(".pdf"): nuevos_ds.append(extraer_datos_pdf_soporte(safe_b64decode(b64_str), fname))
-                                    st.info(f"Drive devolvió {len(archivos)} archivo(s); {len(nuevos_ds)} PDF procesado(s) con IA.")
+                                    seg_ds["lectura (IA)"] = round(time.time() - _t1, 1)
+                                    st.info(f"Drive devolvió {len(archivos)} archivo(s); {len(nuevos_ds)} PDF procesado(s) con IA." + (f" {omit_ds} fuera del rango de fechas se omitieron sin leerlos ni gastar IA." if omit_ds else ""))
                                 else: st.info("No se encontraron archivos en Drive.")
                             else: st.error(f"Error Drive: {res.status_code}")
                         except Exception as e: st.error(f"Error IA: {e}")
@@ -1992,7 +2061,7 @@ elif panel_seleccionado == "📥 1. Recepción & Aprobación":
                 if nuevos_ds:
                     res_ds = guardar_lote_recepcion(curr_tenant_nit, nuevos_ds, "DS", usar_rango_ds, rango_desde_ds, rango_hasta_ds)
                     retener_fuera_de_rango("DS", res_ds["fuera"])
-                    st.session_state['result_upload_ds'] = {"added": res_ds["added"], "skipped": res_ds["skipped"], "leidos": res_ds["leidos"], "n_fuera": len(res_ds["fuera"]), "origen": origen_ds}
+                    st.session_state['result_upload_ds'] = {"added": res_ds["added"], "skipped": res_ds["skipped"], "leidos": res_ds["leidos"], "n_fuera": len(res_ds["fuera"]), "origen": origen_ds, "omitidos": omit_ds, "tiempos": {**seg_ds, "guardado": res_ds.get("seg_guardado")}}
                     st.session_state['ds_up_key'] += 1; st.rerun()
 
                 mostrar_resultado_recepcion("DS")
