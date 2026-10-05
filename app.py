@@ -92,8 +92,25 @@ async def enviar_fila_webhook_async(fila: list, etiqueta: str = "", adjuntos=Non
     """Envía una fila de 26 datos (A-Z) al webhook de Google Sheets."""
     return await asyncio.to_thread(_post_webhook_sync, fila, etiqueta, adjuntos)
 
-def enviar_fila_webhook(fila: list, etiqueta: str = "", adjuntos=None):
-    """Puente síncrono para Streamlit. Guarda el resultado para mostrarlo en pantalla tras el rerun."""
+def destino_es_cxp(clasificacion):
+    """Solo lo que se causa como CXP viaja a Google Sheets. Tarjeta de crédito y caja menor se quedan únicamente en la app.
+    Sin dato (documentos antiguos) se trata como CXP, que es el comportamiento de siempre."""
+    t = str(clasificacion or "").strip().lower()
+    return not (t.startswith("tarjeta") or t.startswith("caja"))
+
+def fila_tesoreria_va_a_sheets(raw_data):
+    """¿Esta fila de Tesorería nació como CXP? Las filas nuevas traen la marca '_destino'; las anteriores de tarjeta se reconocen por su Banco Girador."""
+    try: raw = json.loads(raw_data) if isinstance(raw_data, str) else dict(raw_data or {})
+    except Exception: raw = {}
+    if raw.get("_destino"): return destino_es_cxp(raw["_destino"])
+    return str(raw.get("Banco Girador", "")).strip().lower() != "tarjeta de crédito"
+
+def enviar_fila_webhook(fila: list, etiqueta: str = "", adjuntos=None, destino="CXP"):
+    """Puente síncrono para Streamlit. Guarda el resultado para mostrarlo en pantalla tras el rerun.
+    Si el destino del documento no es CXP (tarjeta, caja menor) NO se envía nada a la hoja."""
+    if not destino_es_cxp(destino):
+        print(f"[Webhook Sheets] {etiqueta}: omitido (destino '{destino}', solo CXP va a Google Sheets)")
+        return {"ok": True, "msg": "No se envía a Google Sheets (no es CXP)", "aviso": "", "etiqueta": etiqueta, "omitido": True}
     try:
         resultado = asyncio.run(enviar_fila_webhook_async(fila, etiqueta, adjuntos))
     except Exception:
@@ -696,7 +713,7 @@ def get_db_connection():
 
 _DDL_TABLAS = [
     'CREATE TABLE IF NOT EXISTS tenants (nit TEXT PRIMARY KEY, razon_social TEXT, siigo_user TEXT, siigo_key TEXT, puc TEXT)',
-    'CREATE TABLE IF NOT EXISTS users (email TEXT PRIMARY KEY, password TEXT, nombre TEXT, tenant_nit TEXT, rol TEXT)',
+    'CREATE TABLE IF NOT EXISTS users (email TEXT PRIMARY KEY, password TEXT, nombre TEXT, tenant_nit TEXT, rol TEXT, activo INTEGER DEFAULT 1)',
     'CREATE TABLE IF NOT EXISTS docs (id TEXT PRIMARY KEY, tenant_nit TEXT, doc_ref TEXT, tipo TEXT, estado TEXT, data TEXT)',
     'CREATE TABLE IF NOT EXISTS history (id TEXT PRIMARY KEY, tenant_nit TEXT, doc_ref TEXT, tipo TEXT, fecha TEXT, total REAL, moneda TEXT, siigo_id TEXT, proveedor TEXT, nit_proveedor TEXT, pdf_b64 TEXT, data_json TEXT, usuario TEXT)',
     'CREATE TABLE IF NOT EXISTS treasury (id TEXT PRIMARY KEY, tenant_nit TEXT, doc_ref TEXT, proveedor TEXT, nit_proveedor TEXT, fecha_recibido TEXT, fecha_vencimiento TEXT, concepto TEXT, centro_costo TEXT, valor_con_iva REAL, total_pagar REAL, estado TEXT, clasificacion TEXT, fecha_propuesta TEXT, observacion TEXT, fecha_pago TEXT, banco_girador TEXT, raw_data TEXT)',
@@ -706,6 +723,8 @@ def init_db():
     conn = get_db_connection()
     c = conn.cursor()
     for _ddl in _DDL_TABLAS: c.execute(_ddl)
+    try: c.execute("ALTER TABLE users ADD COLUMN activo INTEGER DEFAULT 1")   # bases creadas antes de la gestión de usuarios
+    except Exception: pass
     try: c.execute('ALTER TABLE treasury ADD COLUMN raw_data TEXT')
     except: pass
     
@@ -713,7 +732,7 @@ def init_db():
     if c.fetchone()[0] == 0:
         _adm_mail = _secret("ADMIN_EMAIL", "tomas.suta@davinci.tech").lower().strip()
         c.execute("INSERT INTO tenants VALUES (?,?,?,?,?)", ('900557218', 'DAVINCI TECHNOLOGIES SAS', _secret("SIIGO_USER", _adm_mail), _secret("SIIGO_KEY", ""), json.dumps(DEFAULT_PUC)))
-        c.execute("INSERT INTO users VALUES (?,?,?,?,?)", (_adm_mail, hash_password(_secret("ADMIN_INITIAL_PASSWORD", "admin"), _adm_mail), 'Tomás Suta', '900557218', 'SuperAdmin'))
+        c.execute("INSERT INTO users (email, password, nombre, tenant_nit, rol, activo) VALUES (?,?,?,?,?,?)", (_adm_mail, hash_password(_secret("ADMIN_INITIAL_PASSWORD", "admin"), _adm_mail), 'Tomás Suta', '900557218', 'SuperAdmin', 1))
     conn.commit()
     conn.close()
 
@@ -747,11 +766,15 @@ def auto_clean_processed_docs(tenant_nit):
     c.execute("DELETE FROM docs WHERE tenant_nit=? AND id IN (SELECT d.id FROM docs d JOIN history h ON d.tenant_nit = h.tenant_nit AND d.doc_ref = h.doc_ref AND d.tipo = h.tipo)", (tenant_nit,))
     conn.commit(); conn.close()
 
+def _activo(v):
+    """NULL (bases antiguas) cuenta como activo."""
+    return v is None or int(v) != 0
+
 def db_auth_user(email, password):
     email = str(email or "").lower().strip()
     conn = get_db_connection()
     c = conn.cursor()
-    c.execute("SELECT email, nombre, tenant_nit, rol, password FROM users WHERE email=?", (email,))
+    c.execute("SELECT email, nombre, tenant_nit, rol, password, activo FROM users WHERE email=?", (email,))
     user = c.fetchone()
     if not user:
         conn.close()
@@ -762,12 +785,100 @@ def db_auth_user(email, password):
     else:
         # Clave antigua en texto plano: se acepta una vez y se migra a hash automáticamente
         ok = hmac.compare_digest(guardada.encode(), str(password).encode())
-        if ok:
+        if ok and _activo(user[5]):
             c.execute("UPDATE users SET password=? WHERE email=?", (hash_password(password, email), email))
             conn.commit()
     conn.close()
-    if ok: return {"email": user[0], "nombre": user[1], "tenant_nit": user[2], "rol": user[3]}
+    if ok and _activo(user[5]): return {"email": user[0], "nombre": user[1], "tenant_nit": user[2], "rol": user[3]}
     return None
+
+def db_usuario_desactivado(email, password):
+    """True solo si la contraseña es correcta pero el usuario está desactivado (para mostrar un mensaje claro sin revelar nada más)."""
+    email = str(email or "").lower().strip()
+    conn = get_db_connection(); c = conn.cursor()
+    try: c.execute("SELECT password, activo FROM users WHERE email=?", (email,)); r = c.fetchone()
+    finally: conn.close()
+    if not r or _activo(r[1]): return False
+    g = r[0] or ""
+    return hmac.compare_digest(g, hash_password(password, email)) if g.startswith("pbkdf2$") else hmac.compare_digest(g.encode(), str(password).encode())
+
+def db_usuario_vigente(email):
+    """Datos actuales del usuario si existe y está activo; None si fue desactivado o eliminado."""
+    conn = get_db_connection(); c = conn.cursor()
+    try: c.execute("SELECT nombre, rol, tenant_nit, activo FROM users WHERE email=?", (str(email or "").lower().strip(),)); r = c.fetchone()
+    finally: conn.close()
+    if not r or not _activo(r[3]): return None
+    return {"nombre": r[0], "rol": r[1], "tenant_nit": r[2]}
+
+# ---------- Gestión de usuarios (las reglas viven aquí, no solo en la pantalla) ----------
+ROLES_USUARIO = ["Administrativo", "Auxiliar Administrativo", "Asistente Contable", "Administrador", "SuperAdmin"]
+
+def roles_asignables(rol_actor):
+    """Solo un SuperAdmin puede crear o asignar el rol SuperAdmin."""
+    return list(ROLES_USUARIO) if rol_actor == "SuperAdmin" else ROLES_USUARIO[:4]
+
+def puede_gestionar_usuario(rol_actor, rol_objetivo):
+    """SuperAdmin gestiona a todos; Administrador gestiona a su empresa pero nunca a un SuperAdmin."""
+    return rol_actor == "SuperAdmin" or (rol_actor == "Administrador" and rol_objetivo != "SuperAdmin")
+
+def generar_password_temporal(n=10):
+    import secrets, string
+    alfabeto = "".join(ch for ch in string.ascii_letters + string.digits if ch not in "O0Il1")   # sin caracteres que se confunden
+    return "".join(secrets.choice(alfabeto) for _ in range(n))
+
+def db_listar_usuarios(tenant_nit):
+    conn = get_db_connection(); c = conn.cursor()
+    try: c.execute("SELECT email, nombre, rol, activo FROM users WHERE tenant_nit=?", (tenant_nit,)); filas = c.fetchall()
+    finally: conn.close()
+    out = [{"email": f[0], "nombre": f[1] or "", "rol": f[2], "activo": _activo(f[3])} for f in filas]
+    return sorted(out, key=lambda u: (not u["activo"], u["nombre"].lower(), u["email"]))
+
+def _usuario_objetivo(cur, email, tenant_nit):
+    cur.execute("SELECT email, nombre, rol, activo FROM users WHERE email=? AND tenant_nit=?", (str(email or "").lower().strip(), tenant_nit))
+    r = cur.fetchone()
+    if not r: raise ValueError("El usuario no existe en esta empresa.")
+    return {"email": r[0], "nombre": r[1], "rol": r[2], "activo": _activo(r[3])}
+
+def _otros_superadmins_activos(cur, excluir_email):
+    cur.execute("SELECT email, activo FROM users WHERE rol=?", ("SuperAdmin",))
+    return sum(1 for e, a in cur.fetchall() if e != excluir_email and _activo(a))
+
+def db_actualizar_usuario(actor, email, tenant_nit, nombre, rol, activo):
+    """Cambia nombre, rol y estado. Lanza ValueError con el motivo si no está permitido."""
+    nombre = str(nombre or "").strip()
+    if not nombre: raise ValueError("El nombre no puede estar vacío.")
+    conn = get_db_connection(); c = conn.cursor()
+    try:
+        obj = _usuario_objetivo(c, email, tenant_nit)
+        if not puede_gestionar_usuario(actor.get("rol"), obj["rol"]): raise ValueError("No tienes permiso para modificar a este usuario.")
+        if rol not in roles_asignables(actor.get("rol")): raise ValueError("No puedes asignar ese rol.")
+        if obj["email"] == str(actor.get("email", "")).lower().strip() and (rol != obj["rol"] or not activo): raise ValueError("No puedes cambiar tu propio rol ni desactivarte.")
+        if obj["rol"] == "SuperAdmin" and obj["activo"] and (rol != "SuperAdmin" or not activo) and _otros_superadmins_activos(c, obj["email"]) == 0:
+            raise ValueError("Debe quedar al menos un SuperAdmin activo.")
+        c.execute("UPDATE users SET nombre=?, rol=?, activo=? WHERE email=? AND tenant_nit=?", (nombre, rol, 1 if activo else 0, obj["email"], tenant_nit))
+        conn.commit()
+    finally: conn.close()
+
+def db_restablecer_password(actor, email, tenant_nit, nueva):
+    if len(str(nueva or "")) < 6: raise ValueError("La contraseña debe tener al menos 6 caracteres.")
+    conn = get_db_connection(); c = conn.cursor()
+    try:
+        obj = _usuario_objetivo(c, email, tenant_nit)
+        if not puede_gestionar_usuario(actor.get("rol"), obj["rol"]): raise ValueError("No tienes permiso para cambiar la contraseña de este usuario.")
+        c.execute("UPDATE users SET password=? WHERE email=? AND tenant_nit=?", (hash_password(nueva, obj["email"]), obj["email"], tenant_nit))
+        conn.commit()
+    finally: conn.close()
+
+def db_eliminar_usuario(actor, email, tenant_nit):
+    conn = get_db_connection(); c = conn.cursor()
+    try:
+        obj = _usuario_objetivo(c, email, tenant_nit)
+        if not puede_gestionar_usuario(actor.get("rol"), obj["rol"]): raise ValueError("No tienes permiso para eliminar a este usuario.")
+        if obj["email"] == str(actor.get("email", "")).lower().strip(): raise ValueError("No puedes eliminarte a ti mismo.")
+        if obj["rol"] == "SuperAdmin" and obj["activo"] and _otros_superadmins_activos(c, obj["email"]) == 0: raise ValueError("Debe quedar al menos un SuperAdmin activo.")
+        c.execute("DELETE FROM users WHERE email=? AND tenant_nit=?", (obj["email"], tenant_nit))
+        conn.commit()
+    finally: conn.close()
 
 def db_get_tenant(nit):
     conn = get_db_connection()
@@ -859,7 +970,7 @@ def db_get_treasury(tenant_nit):
 
 _TABLAS_RESPALDO = {  # tabla: (llave primaria, columnas)
     "tenants": ("nit", ["nit", "razon_social", "siigo_user", "siigo_key", "puc"]),
-    "users": ("email", ["email", "password", "nombre", "tenant_nit", "rol"]),
+    "users": ("email", ["email", "password", "nombre", "tenant_nit", "rol", "activo"]),
     "docs": ("id", ["id", "tenant_nit", "doc_ref", "tipo", "estado", "data"]),
     "history": ("id", ["id", "tenant_nit", "doc_ref", "tipo", "fecha", "total", "moneda", "siigo_id", "proveedor", "nit_proveedor", "pdf_b64", "data_json", "usuario"]),
     "treasury": ("id", ["id", "tenant_nit", "doc_ref", "proveedor", "nit_proveedor", "fecha_recibido", "fecha_vencimiento", "concepto", "centro_costo", "valor_con_iva", "total_pagar", "estado", "clasificacion", "fecha_propuesta", "observacion", "fecha_pago", "banco_girador", "raw_data"]),
@@ -1059,6 +1170,10 @@ def causar_en_siigo_api(payload, is_ds, tenant_nit, siigo_user, siigo_key):
 # ==========================================
 # 5. PROCESAMIENTO Y PARSEO DE ARCHIVOS
 # ==========================================
+def _o(a, b):
+    """Equivale a `a or b` para elementos XML (falsy = sin hijos), sin usar la comprobación de verdad obsoleta de ElementTree."""
+    return a if (a is not None and len(a) > 0) else b
+
 def parse_ubl_xml(xml_content, pdf_bytes_adjunto=None, tenant_nit=None):
     try:
         root = ET.fromstring(xml_content)
@@ -1102,7 +1217,7 @@ def parse_ubl_xml(xml_content, pdf_bytes_adjunto=None, tenant_nit=None):
 
         lineas_detalle, subtotal_factura, iva_factura = [], 0.0, 0.0
         for linea in root.findall(".//InvoiceLine") or root.findall(".//CreditNoteLine"):
-            desc_node = linea.find(".//Item/Description") or linea.find(".//Description")
+            desc_node = _o(linea.find(".//Item/Description"), linea.find(".//Description"))
             concepto = desc_node.text if desc_node is not None else "Sin descripción"
             qty = float(linea.findtext(".//InvoicedQuantity") or linea.findtext(".//CreditedQuantity") or 1.0)
             precio_uni = float(linea.findtext(".//Price/PriceAmount") or 0.0)
@@ -1117,7 +1232,7 @@ def parse_ubl_xml(xml_content, pdf_bytes_adjunto=None, tenant_nit=None):
             lineas_detalle.append({"Concepto": concepto, "Cantidad": qty, "Valor Unitario": precio_uni, "Subtotal": subtotal_linea, "IVA %": iva_pct, "Valor IVA": iva_valor, "Total Línea": subtotal_linea + iva_valor})
             subtotal_factura += subtotal_linea; iva_factura += iva_valor
 
-        monetary_node = root.find(".//LegalMonetaryTotal") or root.find(".//RequestedMonetaryTotal")
+        monetary_node = _o(root.find(".//LegalMonetaryTotal"), root.find(".//RequestedMonetaryTotal"))
         total_oficial = float(monetary_node.findtext(".//PayableAmount") or (subtotal_factura + iva_factura)) if monetary_node is not None else (subtotal_factura + iva_factura)
         tipo_doc = "Nota Crédito" if root.tag == "CreditNote" else "Factura"
 
@@ -1447,6 +1562,7 @@ def modal_ajuste_ica(hist_record, maestros, curr_tenant_puc, tenant_nit, siigo_u
                             _concepto = " | ".join([str(i.get("description", "")) for i in data_inv.get("items_custom", [])]) or "Documento Soporte"
                             _cc = data_inv.get("centro_costo") or ""
                             _clasif = data_inv.get("Clasificacion_Teso", "Proveedor")
+                        _destino_doc = (data_inv.get("Resumen", {}).get("Clasificacion") if (tipo == 'FC' and "Resumen" in data_inv) else data_inv.get("Clasificacion")) or "CXP"
                         _ten = db_get_tenant(tenant_nit) or {"razon_social": "DAVINCI", "nit": tenant_nit}
                         _rec_adj = {"id_doc_prov": hist_record['id_doc_prov'], "tipo": hist_record['tipo'], "fecha": hist_record['fecha'], "total": hist_record['total'] - float(val_ajuste), "moneda": moneda_fra, "id_siigo_num": hist_record['id_siigo_num'], "proveedor": hist_record['proveedor'], "nit": hist_record['nit'], "data_json": json.dumps(data_inv), "usuario": curr_user_email}
                         _adj_ajuste = armar_adjuntos_webhook(_rec_adj, _ten, solo_causacion=True)
@@ -1456,7 +1572,7 @@ def modal_ajuste_ica(hist_record, maestros, curr_tenant_puc, tenant_nit, siigo_u
                             hist_record['proveedor'], hist_record['nit'], hist_record['fecha'], hist_record['fecha'],
                             moneda_fra, 1.0, _cc, _concepto, 0.0, 0.0, float(val_ajuste),
                             float(hist_record['total']), _nuevo_pagar, "", _clasif, "",
-                            obs=f"Ajuste ReteICA/AIU por {float(val_ajuste):,.0f}"), "Ajuste ReteICA", adjuntos=_adj_ajuste)
+                            obs=f"Ajuste ReteICA/AIU por {float(val_ajuste):,.0f}"), "Ajuste ReteICA", adjuntos=_adj_ajuste, destino=_destino_doc)
                     except Exception as _e_adj:
                         print(f"[Webhook Sheets] Error armando ajuste: {_e_adj}")
                     st.success(msg); st.balloons(); st.rerun()
@@ -1476,6 +1592,7 @@ if st.session_state['authenticated_user'] is None:
         <div><span class='chip-lite'>Siigo</span><span class='chip-lite'>Google Sheets</span><span class='chip-lite'>IA</span></div>
     </div>
     """, unsafe_allow_html=True)
+    if st.session_state.get('aviso_login'): st.warning(st.session_state.pop('aviso_login'))
     with st.container():
         st.markdown("<div class='login-box'>", unsafe_allow_html=True)
         with st.form("form_login"):
@@ -1491,6 +1608,8 @@ if st.session_state['authenticated_user'] is None:
                     st.session_state['authenticated_user'] = user_info
                     st.toast(f"¡Bienvenido, {user_info['nombre']}!", icon="🎉")
                     st.rerun()
+                elif db_usuario_desactivado(email_in, pass_in):
+                    st.error("🚫 Tu usuario está desactivado. Comunícate con el administrador.")
                 else:
                     _registrar_fallo(email_in)
                     st.error("❌ Correo o contraseña incorrectos.")
@@ -1501,6 +1620,12 @@ if st.session_state['authenticated_user'] is None:
 # 8. SESIÓN Y PERMISOS DE USUARIOS
 # ==========================================
 curr_user = st.session_state['authenticated_user']
+_vigente = db_usuario_vigente(curr_user['email'])
+if _vigente is None:   # lo desactivaron o eliminaron mientras tenía la sesión abierta
+    st.session_state['authenticated_user'] = None
+    st.session_state['aviso_login'] = "Tu usuario fue desactivado o eliminado. Comunícate con el administrador."
+    st.rerun()
+curr_user.update({"nombre": _vigente["nombre"], "rol": _vigente["rol"]})   # un cambio de rol se aplica sin volver a entrar
 curr_rol = curr_user['rol']
 
 _ini_user = "".join([p[0] for p in str(curr_user['nombre']).split()[:2]]).upper() or "U"
@@ -2093,6 +2218,7 @@ elif panel_seleccionado == "🏢 2. Causación Siigo (CXP)":
                                         "Estado": "Por pagar",
                                         "Valor a Pagar - Vr fra USD": real_total_pagar
                                     }
+                                    raw_teso["_destino"] = "CXP"
                                     db_save_treasury(curr_tenant_nit, str(num_fac_clean), r["Proveedor"], nit_ingresado, r["Fecha"], r.get("FechaVencimiento", r["Fecha"]), concepto_teso, cc_teso, total_neto_calculado, real_total_pagar, "Por pagar", clasif_t, raw_data=json.dumps(raw_teso))
                                     
                                     # 🔔 WEBHOOK GOOGLE SHEETS (CXP)
@@ -2240,16 +2366,10 @@ elif panel_seleccionado == "💳 3. Causación Tarjetas":
                                         "Banco Girador": "Tarjeta de Crédito",
                                         "Fecha de Pago": r.get("Fecha", datetime.now().strftime("%Y-%m-%d"))
                                     }
+                                    raw_teso["_destino"] = "Tarjeta"
                                     db_save_treasury(curr_tenant_nit, str(num_fac_clean), r["Proveedor"], nit_ingresado, r["Fecha"], r.get("FechaVencimiento", r["Fecha"]), concepto_teso, cc_teso, total_neto_calculado, real_total_pagar, "Pagado", clasif_t, fecha_pago=r["Fecha"], banco="Tarjeta de Crédito", raw_data=json.dumps(raw_teso))
                                     
-                                    # 🔔 WEBHOOK GOOGLE SHEETS (TARJETA)
-                                    _adj_tc = armar_adjuntos_webhook({"id_doc_prov": r["ID"], "tipo": "FC", "fecha": fecha_fac, "total": total_neto_calculado, "moneda": "COP", "id_siigo_num": f"{doc_num_siigo}|||{doc_id_siigo}", "proveedor": r["Proveedor"], "nit": nit_ingresado, "data_json": json.dumps(doc), "usuario": curr_user["email"]}, curr_tenant)
-                                    enviar_fila_webhook(construir_fila_webhook(
-                                        "Tarjeta", curr_tenant, curr_user["email"], "FC", num_fac_clean, doc_num_siigo,
-                                        r["Proveedor"], nit_ingresado, fecha_fac, r.get("FechaVencimiento", fecha_fac),
-                                        "COP", 1.0, cc_teso, concepto_teso, acum_subtotal, acum_iva, 0.0,
-                                        total_neto_calculado, real_total_pagar, pago_sel, clasif_t, "Pagado",
-                                        fecha_pago=r["Fecha"], obs="Tarjeta de Crédito"), "Tarjeta", adjuntos=_adj_tc)
+                                    # (Tarjeta de crédito: NO se envía a Google Sheets; a la hoja solo va lo que se cause como CXP)
                                     
                                     st.toast(f"✅ T.C. Causada exitosamente: {doc_num_siigo}", icon="🎉"); st.rerun()
                                 else: st.error(msg)
@@ -2426,16 +2546,17 @@ elif panel_seleccionado == "📄 4. Documentos Soporte (DS)":
                                         "Estado": "Por pagar",
                                         "Valor a Pagar - Vr fra USD": real_total_pagar
                                     }
+                                    raw_teso["_destino"] = ds.get("Clasificacion") or "CXP"
                                     db_save_treasury(curr_tenant_nit, str(num_ref_clean), prov_nombre, nit_ingresado, ds["fecha"], ds.get("FechaVencimiento", ds["fecha"]), concepto_teso, cc_teso, total_enviar_ds, real_total_pagar, "Por pagar", clasif_t, raw_data=json.dumps(raw_teso))
                                     
                                     # 🔔 WEBHOOK GOOGLE SHEETS (DS)
-                                    _adj_ds = armar_adjuntos_webhook({"id_doc_prov": ds["documento_ref"], "tipo": "DS", "fecha": fecha_ds, "total": total_enviar_ds, "moneda": moneda_sel, "id_siigo_num": f"{doc_num_siigo}|||{doc_id_siigo}", "proveedor": prov_nombre, "nit": nit_ingresado, "data_json": json.dumps(ds), "usuario": curr_user["email"]}, curr_tenant)
+                                    _adj_ds = [] if not destino_es_cxp(ds.get("Clasificacion")) else armar_adjuntos_webhook({"id_doc_prov": ds["documento_ref"], "tipo": "DS", "fecha": fecha_ds, "total": total_enviar_ds, "moneda": moneda_sel, "id_siigo_num": f"{doc_num_siigo}|||{doc_id_siigo}", "proveedor": prov_nombre, "nit": nit_ingresado, "data_json": json.dumps(ds), "usuario": curr_user["email"]}, curr_tenant)
                                     enviar_fila_webhook(construir_fila_webhook(
                                         "DS", curr_tenant, curr_user["email"], "DS", num_ref_clean, doc_num_siigo,
                                         prov_nombre, nit_ingresado, fecha_ds, ds.get("FechaVencimiento", fecha_ds),
                                         moneda_sel, trm_val if moneda_sel == "USD" else 1.0, cc_teso, concepto_teso,
                                         acum_subtotal_ds, acum_iva_ds, round(total_enviar_ds - real_total_pagar, 2),
-                                        total_enviar_ds, real_total_pagar, pago_sel, clasif_t, "Por pagar"), "DS", adjuntos=_adj_ds)
+                                        total_enviar_ds, real_total_pagar, pago_sel, clasif_t, "Por pagar"), "DS", adjuntos=_adj_ds, destino=ds.get("Clasificacion") or "CXP")
                                     
                                     st.toast(f"✅ Causada exitosamente: {doc_num_siigo}", icon="🎉"); st.rerun()
                                 else: st.error(msg)
@@ -2633,6 +2754,7 @@ elif panel_seleccionado == "💰 8. Tesorería (CXP & Pagos)":
                             nit_digitos = re.sub(r'\D', '', nit)
                             unique_id = f"{curr_tenant_nit}_{nit_digitos}_{doc_ref}_{idx}"
                             
+                            raw_dict["_destino"] = "CXP"   # los saldos iniciales vienen de la hoja de CXP
                             db_save_treasury(curr_tenant_nit, doc_ref, prov, nit, f_rec, f_venc, concepto, cc, val_iva, tot_pagar, estado, clasif, raw_data=json.dumps(raw_dict), unique_id=unique_id)
                             filas_cargadas += 1
                         except Exception:
@@ -2813,7 +2935,7 @@ elif panel_seleccionado == "💰 8. Tesorería (CXP & Pagos)":
                                 banco_girador, row["clasificacion"], nuevo_estado,
                                 fecha_pago=fecha_real.strftime("%Y-%m-%d") if nuevo_estado == "Pagado" else "",
                                 obs=obs_pago,
-                                fecha_prop=fecha_prop.strftime("%Y-%m-%d")), "Tesorería")
+                                fecha_prop=fecha_prop.strftime("%Y-%m-%d")), "Tesorería", destino="CXP" if fila_tesoreria_va_a_sheets(row.get("raw_data")) else "Tarjeta")
                             
                             st.toast("✅ Documento actualizado exitosamente.", icon="💰")
                             st.rerun()
@@ -2826,6 +2948,7 @@ elif panel_seleccionado == "💰 8. Tesorería (CXP & Pagos)":
         for idx, t in df_filtrado.iterrows():
             try: r_data = json.loads(t.get("raw_data") or "{}")
             except: r_data = {}
+            r_data = {k: v for k, v in r_data.items() if not str(k).startswith("_")}   # sin marcas internas
             
             r_data["Empresa"] = curr_tenant['razon_social']
             r_data["Estado"] = t["estado"]
@@ -2873,7 +2996,7 @@ elif panel_seleccionado == "⚙️ Configuración Empresa":
                             conn = get_db_connection()
                             try:
                                 conn.execute("INSERT INTO tenants VALUES (?,?,?,?,?)", (new_t_nit.strip(), new_t_razon.strip(), new_t_user.strip(), new_t_key.strip(), json.dumps(DEFAULT_PUC)))
-                                conn.execute("INSERT INTO users VALUES (?,?,?,?,?)", (f"admin@{new_t_nit}.com", hash_password("123456", f"admin@{new_t_nit}.com"), f"Admin {new_t_razon}", new_t_nit.strip(), "Administrador"))
+                                conn.execute("INSERT INTO users (email, password, nombre, tenant_nit, rol, activo) VALUES (?,?,?,?,?,?)", (f"admin@{new_t_nit}.com", hash_password("123456", f"admin@{new_t_nit}.com"), f"Admin {new_t_razon}", new_t_nit.strip(), "Administrador", 1))
                                 conn.commit(); st.success(f"✅ Empresa {new_t_razon} creada."); st.rerun()
                             except Exception as e: st.error(f"❌ Error: {e}")
                             finally: conn.close()
@@ -2911,26 +3034,68 @@ elif panel_seleccionado == "⚙️ Configuración Empresa":
                     except Exception as e_imp: st.error(f"❌ No se pudo importar: {e_imp}")
 
         st.markdown("---")
+        roles_ok = roles_asignables(curr_rol)
         col_u1, col_u2 = st.columns([1.5, 2])
         with col_u1:
             st.markdown("#### 👥 Registrar Usuario")
             with st.form("form_user"):
                 u_email, u_pass, u_name = st.text_input("Correo"), st.text_input("Contraseña", type="password"), st.text_input("Nombre Completo")
-                u_rol = st.selectbox("Rol Asignado", ["Administrativo", "Auxiliar Administrativo", "Asistente Contable", "Administrador"])
+                u_rol = st.selectbox("Rol Asignado", roles_ok)
                 if st.form_submit_button("➕ Crear Usuario"):
                     if u_email and u_pass:
                         conn = get_db_connection()
                         try:
-                            conn.execute("INSERT INTO users VALUES (?,?,?,?,?)", (u_email.lower().strip(), hash_password(u_pass, u_email), u_name, curr_tenant_nit, u_rol))
+                            conn.execute("INSERT INTO users (email, password, nombre, tenant_nit, rol, activo) VALUES (?,?,?,?,?,?)", (u_email.lower().strip(), hash_password(u_pass, u_email), u_name, curr_tenant_nit, u_rol, 1))
                             conn.commit(); st.success(f"✅ Usuario {u_name} registrado."); st.rerun()
                         except Exception: st.error("❌ El correo ya está registrado.")
                         finally: conn.close()
                     else: st.error("Complete el correo y la contraseña.")
 
+        usuarios_emp = db_listar_usuarios(curr_tenant_nit)
         with col_u2:
-            st.markdown("#### 📋 Usuarios Existentes")
-            conn = get_db_connection(); c = conn.cursor()
-            c.execute("SELECT email, nombre, rol FROM users WHERE tenant_nit=?", (curr_tenant_nit,))
-            user_rows = c.fetchall(); conn.close()
-            if user_rows: st.dataframe(pd.DataFrame(user_rows, columns=["Correo", "Nombre", "Rol"]), use_container_width=True)
+            st.markdown("#### 📋 Usuarios de esta empresa")
+            if usuarios_emp: st.dataframe(pd.DataFrame([{"Correo": u["email"], "Nombre": u["nombre"], "Rol": u["rol"], "Estado": "✅ Activo" if u["activo"] else "⛔ Inactivo"} for u in usuarios_emp]), use_container_width=True, hide_index=True)
             else: st.info("No hay usuarios registrados.")
+
+        st.markdown("---")
+        st.markdown("#### ✏️ Modificar o eliminar usuarios")
+        gestionables = [u for u in usuarios_emp if puede_gestionar_usuario(curr_rol, u["rol"])]
+        if not gestionables: st.info("No hay usuarios que puedas gestionar.")
+        else:
+            mapa_u = {u["email"]: u for u in gestionables}
+            u_sel = mapa_u.get(st.selectbox("Usuario (correo)", list(mapa_u.keys()))) or gestionables[0]   # solo el correo: así la selección no salta a otro usuario al guardar
+            st.caption(f"{u_sel['nombre'] or '—'}  ·  {u_sel['rol']}  ·  {'✅ Activo' if u_sel['activo'] else '⛔ Inactivo'}")
+            k_u = re.sub(r'\W', '_', u_sel["email"])
+            with st.form(f"form_edit_user_{k_u}"):
+                e_nombre = st.text_input("Nombre completo", value=u_sel["nombre"], key=f"e_nombre_{k_u}")
+                e_rol = st.selectbox("Rol", roles_ok, index=roles_ok.index(u_sel["rol"]) if u_sel["rol"] in roles_ok else 0, key=f"e_rol_{k_u}")
+                e_activo = st.checkbox("Usuario activo (puede iniciar sesión)", value=u_sel["activo"], key=f"e_activo_{k_u}")
+                e_pass = st.text_input("Nueva contraseña (opcional: déjala vacía para no cambiarla)", type="password", key=f"e_pass_{k_u}")
+                if st.form_submit_button("💾 Guardar cambios", type="primary"):
+                    try:
+                        db_actualizar_usuario(curr_user, u_sel["email"], curr_tenant_nit, e_nombre, e_rol, e_activo)
+                        if e_pass: db_restablecer_password(curr_user, u_sel["email"], curr_tenant_nit, e_pass)
+                        st.toast(f"✅ Cambios guardados para {u_sel['email']}.", icon="👤"); st.rerun()
+                    except ValueError as err_u: st.error(f"❌ {err_u}")
+            c_tmp, c_del = st.columns(2)
+            with c_tmp.expander("🔑 Generar contraseña temporal"):
+                st.caption("Crea una contraseña al azar, la aplica y la muestra para que se la entregues al usuario.")
+                if st.button("Generar y aplicar", key=f"btn_tmp_{k_u}"):
+                    _tmp = generar_password_temporal()
+                    try:
+                        db_restablecer_password(curr_user, u_sel["email"], curr_tenant_nit, _tmp)
+                        st.session_state["pass_temporal"] = (u_sel["email"], _tmp)
+                    except ValueError as err_u: st.error(f"❌ {err_u}")
+                _pt = st.session_state.get("pass_temporal")
+                if _pt and _pt[0] == u_sel["email"]:
+                    st.success(f"Contraseña temporal de {_pt[0]}:")
+                    st.code(_pt[1])
+                    if st.button("Ocultar", key=f"btn_hide_tmp_{k_u}"): st.session_state.pop("pass_temporal", None); st.rerun()
+            with c_del.expander("🗑️ Eliminar usuario"):
+                st.warning("Esto borra el acceso de forma definitiva. Si solo quieres que no entre más, desmarca «Usuario activo» arriba: así conservas su historial y puedes reactivarlo.")
+                conf_del = st.checkbox("Sí, quiero eliminar este usuario", key=f"conf_del_{k_u}")
+                if st.button("Eliminar definitivamente", key=f"btn_del_user_{k_u}", disabled=not conf_del):
+                    try:
+                        db_eliminar_usuario(curr_user, u_sel["email"], curr_tenant_nit)
+                        st.toast(f"🗑️ Usuario {u_sel['email']} eliminado.", icon="✅"); st.rerun()
+                    except ValueError as err_u: st.error(f"❌ {err_u}")
