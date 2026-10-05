@@ -315,7 +315,7 @@ def mostrar_resultado_recepcion(tipo):
         if res["skipped"]: st.warning("⚠️ **Ya estaban registrados:**\n" + "\n".join([f"* {i}" for i in res["skipped"]]))
     fuera = st.session_state.get(k_fuera) or []
     if fuera:
-        with st.expander(f"📅 {len(fuera)} documento(s) fuera del rango de fechas: retenidos, no se perdieron", expanded=True):
+        with st.expander(f"📅 {len(fuera)} documento(s) fuera del rango de fechas: retenidos, no se perdieron", expanded=False):
             filas = []
             for it in fuera:
                 ref, nit, fecha, prov, total = _campos_doc(it, tipo)
@@ -1912,7 +1912,7 @@ elif panel_seleccionado == "📥 1. Recepción & Aprobación":
                 uploaded_fc = st.file_uploader("Arrastra aquí tus archivos XML o ZIP", type=["zip", "xml"], accept_multiple_files=True, key=f"up_fc_p1_{st.session_state['fc_up_key']}", label_visibility="collapsed")
                 
                 f_r1, f_r2, f_r3 = st.columns([1.6, 1.2, 1.2])
-                usar_rango_fc = f_r1.checkbox("📅 Filtrar por fecha de emisión", value=True, key="rango_fc_on", help="Solo carga facturas emitidas dentro del rango. Las de fuera quedan retenidas y puedes cargarlas igual.")
+                usar_rango_fc = f_r1.checkbox("📅 Filtrar por fecha de emisión", value=True, key="rango_fc_on", help="Solo carga y muestra facturas emitidas dentro del rango. De Drive, las de fuera simplemente no se cargan (siguen en Drive). Las pendientes ya cargadas fuera del rango se ocultan de la lista, no se borran.")
                 rango_desde_fc = f_r2.date_input("Desde", value=datetime.strptime(FECHA_MINIMA_RECEPCION, "%Y-%m-%d").date(), key="rango_fc_desde", disabled=not usar_rango_fc)
                 rango_hasta_fc = f_r3.date_input("Hasta", value=datetime.now().date(), key="rango_fc_hasta", disabled=not usar_rango_fc)
                 if usar_rango_fc and rango_desde_fc > rango_hasta_fc: st.warning("La fecha 'Desde' es posterior a 'Hasta': no se cargará ninguna factura.")
@@ -1944,7 +1944,7 @@ elif panel_seleccionado == "📥 1. Recepción & Aprobación":
 
                 if data_list:
                     res_fc = guardar_lote_recepcion(curr_tenant_nit, data_list, "FC", usar_rango_fc, rango_desde_fc, rango_hasta_fc)
-                    retener_fuera_de_rango("FC", res_fc["fuera"])
+                    if origen_fc != "Google Drive": retener_fuera_de_rango("FC", res_fc["fuera"])   # de Drive no se retiene: los archivos siguen allí
                     st.session_state['result_upload_fc'] = {"added": res_fc["added"], "skipped": res_fc["skipped"], "leidos": res_fc["leidos"], "n_fuera": len(res_fc["fuera"]), "origen": origen_fc, "omitidos": stats_drive.get("omitidos_fecha", 0), "tiempos": {"descarga": stats_drive.get("seg_descarga"), "lectura": stats_drive.get("seg_lectura"), "guardado": res_fc.get("seg_guardado")}}
                     st.session_state['fc_up_key'] += 1; st.rerun()
 
@@ -1954,8 +1954,11 @@ elif panel_seleccionado == "📥 1. Recepción & Aprobación":
         with fc_sub_tab1:
             fc_pendientes = db_get_docs(curr_tenant_nit, "FC", "Pendiente")
             fc_pendientes = sorted(fc_pendientes, key=lambda x: str(x.get("Resumen", {}).get("Fecha", "")), reverse=True)
+            n_fc_total = len(fc_pendientes)
+            if usar_rango_fc: fc_pendientes = [f for f in fc_pendientes if fecha_en_rango(f.get("Resumen", {}).get("Fecha", ""), True, rango_desde_fc, rango_hasta_fc)]
+            if n_fc_total > len(fc_pendientes): st.caption(f"👁️ Mostrando {len(fc_pendientes)} de {n_fc_total} pendientes: {n_fc_total - len(fc_pendientes)} están fuera del rango {rango_desde_fc} a {rango_hasta_fc} y quedan ocultas (no se borraron). Desmarca «Filtrar por fecha de emisión» para verlas.")
             
-            if not fc_pendientes: st.info("No hay facturas pendientes en la bandeja.")
+            if not fc_pendientes: st.info("No hay facturas pendientes en la bandeja." if n_fc_total == 0 else f"No hay facturas pendientes dentro del rango; hay {n_fc_total} fuera de él (desmarca el filtro para verlas).")
             else:
                 curr_m = ""
                 for idx_doc, f in enumerate(fc_pendientes):
@@ -2036,7 +2039,7 @@ elif panel_seleccionado == "📥 1. Recepción & Aprobación":
                 uploaded_ds = st.file_uploader("Arrastra aquí tus archivos PDF", type=["pdf"], accept_multiple_files=True, key=f"up_ds_p1_{st.session_state['ds_up_key']}", label_visibility="collapsed")
                 
                 f_d1, f_d2, f_d3 = st.columns([1.6, 1.2, 1.2])
-                usar_rango_ds = f_d1.checkbox("📅 Filtrar por fecha del documento", value=True, key="rango_ds_on", help="Solo carga documentos con fecha dentro del rango. Los de fuera quedan retenidos y puedes cargarlos igual.")
+                usar_rango_ds = f_d1.checkbox("📅 Filtrar por fecha del documento", value=True, key="rango_ds_on", help="Solo carga y muestra documentos con fecha dentro del rango. De Drive, los de fuera simplemente no se cargan (siguen en Drive). Los pendientes ya cargados fuera del rango se ocultan de la lista, no se borran.")
                 rango_desde_ds = f_d2.date_input("Desde", value=datetime.strptime(FECHA_MINIMA_RECEPCION, "%Y-%m-%d").date(), key="rango_ds_desde", disabled=not usar_rango_ds)
                 rango_hasta_ds = f_d3.date_input("Hasta", value=datetime.now().date(), key="rango_ds_hasta", disabled=not usar_rango_ds)
                 if usar_rango_ds and rango_desde_ds > rango_hasta_ds: st.warning("La fecha 'Desde' es posterior a 'Hasta': no se cargará ningún documento.")
@@ -2073,7 +2076,7 @@ elif panel_seleccionado == "📥 1. Recepción & Aprobación":
 
                 if nuevos_ds:
                     res_ds = guardar_lote_recepcion(curr_tenant_nit, nuevos_ds, "DS", usar_rango_ds, rango_desde_ds, rango_hasta_ds)
-                    retener_fuera_de_rango("DS", res_ds["fuera"])
+                    if origen_ds != "Google Drive": retener_fuera_de_rango("DS", res_ds["fuera"])
                     st.session_state['result_upload_ds'] = {"added": res_ds["added"], "skipped": res_ds["skipped"], "leidos": res_ds["leidos"], "n_fuera": len(res_ds["fuera"]), "origen": origen_ds, "omitidos": omit_ds, "tiempos": {**seg_ds, "guardado": res_ds.get("seg_guardado")}}
                     st.session_state['ds_up_key'] += 1; st.rerun()
 
@@ -2083,8 +2086,11 @@ elif panel_seleccionado == "📥 1. Recepción & Aprobación":
         with ds_sub_tab1:
             ds_pendientes = db_get_docs(curr_tenant_nit, "DS", "Pendiente")
             ds_pendientes = sorted(ds_pendientes, key=lambda x: str(x.get("fecha", "")), reverse=True)
+            n_ds_total = len(ds_pendientes)
+            if usar_rango_ds: ds_pendientes = [d for d in ds_pendientes if fecha_en_rango(d.get("fecha", ""), True, rango_desde_ds, rango_hasta_ds)]
+            if n_ds_total > len(ds_pendientes): st.caption(f"👁️ Mostrando {len(ds_pendientes)} de {n_ds_total} pendientes: {n_ds_total - len(ds_pendientes)} están fuera del rango {rango_desde_ds} a {rango_hasta_ds} y quedan ocultos (no se borraron). Desmarca «Filtrar por fecha del documento» para verlos.")
             
-            if not ds_pendientes: st.info("No hay Documentos Soporte pendientes.")
+            if not ds_pendientes: st.info("No hay Documentos Soporte pendientes." if n_ds_total == 0 else f"No hay documentos pendientes dentro del rango; hay {n_ds_total} fuera de él (desmarca el filtro para verlos).")
             else:
                 curr_m = ""
                 for idx_ds, d in enumerate(ds_pendientes):
