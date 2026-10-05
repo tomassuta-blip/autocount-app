@@ -405,7 +405,7 @@ def conciliar_dian(tenant_nit, dian):
         if not lugares and r["folio_num"] and r["folio_num"] != clave:
             lugares = idx.get((nit, r["folio_num"])); por_folio = bool(lugares)
         base = {"Fecha emisión": r["fecha"], "Tipo": r["tipo"], "Documento": r["numero"], "NIT emisor": nit, "Proveedor": r["proveedor"], "Total DIAN": r["total_num"],
-                "Estado DIAN": r["estado"], "Recibido": str(r["fecha_recepcion"])[:16].replace("T", " ")}
+                "Estado DIAN": r["estado"], "Recibido": str(r["fecha_recepcion"])[:16].replace("T", " "), "CUFE/CUDE": str(r["cufe"]).strip()}
         if not lugares: faltan.append(base); continue
         estan.append({**base, "Dónde está en la app": " + ".join(dict.fromkeys(lugares)) + (" (coincidencia solo por folio)" if por_folio else "")})
         k = (nit, r["folio_num"] if por_folio else clave)
@@ -3201,7 +3201,18 @@ elif panel_seleccionado == "🏛️ Conciliación DIAN":
                         t_f, t_e, t_d, t_s = st.tabs([f"❌ Faltan en la app ({len(res['faltan'])})", f"✅ Ya están ({len(res['estan'])})", f"⚖️ Diferencias de valor ({len(res['diferencias'])})", f"🔎 En la app, no en el reporte ({len(res['solo_app'])})"])
                         with t_f:
                             st.caption("Documentos que la DIAN dice que recibiste y que NO están en la app (ni en bandeja, ni causados, ni en tesorería). Pide el XML al proveedor o búscalo en el correo.")
-                            if len(res["faltan"]): st.dataframe(res["faltan"], use_container_width=True, hide_index=True)
+                            if len(res["faltan"]):
+                                st.dataframe(res["faltan"], use_container_width=True, hide_index=True)
+                                cufes_f = [(r["Documento"], str(r["Proveedor"]), float(r["Total DIAN"] or 0), str(r["CUFE/CUDE"]).strip()) for r in res["faltan"].to_dict("records") if str(r.get("CUFE/CUDE", "")).strip()]
+                                if cufes_f:
+                                    with st.expander("📋 Copiar los CUFE para descargar el ZIP en la DIAN", expanded=True):
+                                        st.caption(f"Todos los CUFE, uno por línea (usa el ícono de copiar de la esquina del recuadro). Si la DIAN pide una identificación al buscar, usa el NIT de la empresa: {curr_tenant_nit}.")
+                                        st.code("\n".join(c[3] for c in cufes_f), language=None)
+                                        for doc_f, prov_f, tot_f, cufe_f in cufes_f[:100]:
+                                            cf1, cf2 = st.columns([2, 5])
+                                            cf1.markdown(f"**{doc_f}**  \n{prov_f[:34]}  \n${tot_f:,.0f}  \n[🔗 Abrir en la DIAN](https://catalogo-vpfe.dian.gov.co/document/searchqr?documentkey={cufe_f})")
+                                            cf2.code(cufe_f, language=None)
+                                        if len(cufes_f) > 100: st.caption(f"Se muestran 100 de {len(cufes_f)}; los demás están en la tabla y en el Excel.")
                         with t_e: 
                             if len(res["estan"]): st.dataframe(res["estan"], use_container_width=True, hide_index=True)
                         with t_d:
