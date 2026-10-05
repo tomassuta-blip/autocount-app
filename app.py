@@ -1323,6 +1323,9 @@ def extraer_facturas_desde_drive_cloud(web_app_url, data_list, tenant_nit=None, 
         if res.status_code == 200:
             try: archivos = res.json()
             except Exception:
+                if "<html" in res.text[:300].lower() or "<!doctype" in res.text[:300].lower():
+                    return False, ("Google devolvió una PÁGINA WEB en vez de los datos. Casi siempre es por el acceso de la implementación (debe ser «Ejecutar como: Yo» y «Quién tiene acceso: Cualquier persona»), "
+                                   "por permisos sin autorizar o por un error dentro del script. Abre la URL del script en una ventana de incógnito para ver el mensaje real, o mira «Ejecuciones» en Apps Script.")
                 return False, f"Drive respondió algo que NO es JSON (¿cambió el permiso o la URL del script?). Inicio de la respuesta: {res.text[:120]!r}"
             if stats is not None:
                 stats["archivos"] = len(archivos) if isinstance(archivos, list) else 0
@@ -1332,6 +1335,13 @@ def extraer_facturas_desde_drive_cloud(web_app_url, data_list, tenant_nit=None, 
                     exts[ext] = exts.get(ext, 0) + 1
                 stats["detalle"] = ", ".join(f"{n} {e}" for e, n in exts.items())
             if not isinstance(archivos, list) or len(archivos) == 0: return True, "No se encontraron archivos."
+            aviso, fechas = "", sorted(str(it.get("fecha")) for it in archivos if isinstance(it, dict) and it.get("fecha"))
+            if desde and hasta:
+                filtros = {str(it.get("filtro", "")) for it in archivos if isinstance(it, dict)}
+                fallos = [f for f in filtros if f.startswith("gmail_fallo")]
+                if filtros == {""}: aviso = "El script de Drive publicado es una versión ANTERIOR: no entiende el rango y devolvió todo. Pega el script nuevo y publica una NUEVA VERSIÓN (Implementar > Administrar implementaciones > lápiz > Nueva versión)."
+                elif fallos: aviso = f"El script no pudo consultar Gmail ({fallos[0][13:].strip()}) y devolvió los archivos SIN filtrar por correo. Ejecuta guardarFacturasEnDrive una vez desde el editor de Apps Script (acepta los permisos de Gmail) y publica una nueva versión."
+            if stats is not None: stats["aviso_script"] = aviso
             t1, omitidos = time.time(), 0
             lim_ini, lim_fin = ((desde - timedelta(days=7)).strftime("%Y-%m-%d"), (hasta + timedelta(days=7)).strftime("%Y-%m-%d")) if (desde and hasta) else (None, None)
             for item in archivos:
@@ -1347,6 +1357,7 @@ def extraer_facturas_desde_drive_cloud(web_app_url, data_list, tenant_nit=None, 
             if stats is not None: stats["omitidos_fecha"], stats["seg_lectura"] = omitidos, round(time.time() - t1, 1)
             msg = f"Se leyeron {len(archivos) - omitidos} de {len(archivos)} archivo(s) desde Drive."
             if omitidos: msg += f" {omitidos} fuera del rango de fechas se omitieron sin leerlos."
+            if fechas: msg += f" Fechas de los archivos recibidos: {fechas[0]} → {fechas[-1]}."
             return True, msg
         else: return False, f"Error HTTP {res.status_code} al conectar con Drive."
     except Exception as e: return False, f"Error Drive: {e}"
@@ -1921,11 +1932,13 @@ elif panel_seleccionado == "📥 1. Recepción & Aprobación":
                 
                 if btn_drive_fc:
                     origen_fc = "Google Drive"
-                    url_api = _secret("DRIVE_FC_URL", "https://script.google.com/macros/s/AKfycbyyujzRVc6JsE--ENDSDiAMyIDNKJbDxbUirpTBXnc3KJxNI6HJfU7dJT9di97UTuzK/exec")
+                    url_api = _secret("DRIVE_FC_URL", "https://script.google.com/macros/s/AKfycbyN7yDxN-bSnXTH8Q2IPrHHgE6qRVnq4dWyfxBI-fj3qP5SLb9yvLfM565bMftp5J31/exec")
                     with st.spinner("Consultando Google Drive Nube..."):
                         exito_d, msg_d = extraer_facturas_desde_drive_cloud(url_api, data_list, tenant_nit=curr_tenant_nit, stats=stats_drive, desde=rango_desde_fc if usar_rango_fc else None, hasta=rango_hasta_fc if usar_rango_fc else None)
                         if not exito_d: st.error(msg_d)
-                        else: st.info(msg_d)
+                        else:
+                            st.info(msg_d)
+                            if stats_drive.get("aviso_script"): st.warning("⚠️ " + stats_drive["aviso_script"])
                     if exito_d and stats_drive.get("archivos", 0) - stats_drive.get("omitidos_fecha", 0) > 0 and not data_list:
                         st.warning(f"Drive devolvió {stats_drive['archivos']} archivo(s) ({stats_drive.get('detalle', '')}) pero ninguno produjo una factura. Pueden ser eventos de la DIAN (acuses), facturas emitidas a otro NIT, o archivos que no son XML/ZIP.")
 
