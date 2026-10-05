@@ -1,4 +1,5 @@
 import io
+import unicodedata
 import os
 import re
 import zipfile
@@ -335,6 +336,94 @@ def retener_fuera_de_rango(tipo, nuevos):
     actuales = {(_campos_doc(x, tipo)[0], re.sub(r'\D', '', str(_campos_doc(x, tipo)[1]))): x for x in (st.session_state.get(k) or [])}
     for x in nuevos: actuales[(_campos_doc(x, tipo)[0], re.sub(r'\D', '', str(_campos_doc(x, tipo)[1])))] = x
     st.session_state[k] = list(actuales.values())
+
+# ==========================================
+# CONCILIACIÓN CON EL REPORTE DE LA DIAN (SOLO LECTURA: no escribe nada en la base de datos)
+# ==========================================
+def _norm_col(c):
+    t = "".join(ch for ch in unicodedata.normalize("NFD", str(c)) if unicodedata.category(ch) != "Mn")
+    return re.sub(r"\s+", " ", t).strip().lower()
+
+_COLS_DIAN = {"tipo de documento": "tipo", "cufe/cude": "cufe", "folio": "folio", "prefijo": "prefijo", "fecha emision": "fecha_emision", "fecha recepcion": "fecha_recepcion",
+              "nit emisor": "nit_emisor", "nombre emisor": "proveedor", "nit receptor": "nit_receptor", "total": "total", "estado": "estado"}
+
+def leer_reporte_dian(datos, tenant_nit=None):
+    """Lee el Excel de documentos de la DIAN. Ignora las filas 'Application response' (acuses). Devuelve (DataFrame de documentos, resumen)."""
+    try: df = pd.read_excel(io.BytesIO(datos), sheet_name=0, dtype=str)
+    except Exception as e: raise ValueError(f"No se pudo abrir el Excel: {e}")
+    df = df.rename(columns={c: _COLS_DIAN[_norm_col(c)] for c in df.columns if _norm_col(c) in _COLS_DIAN})
+    faltan = [n for n in ("tipo", "folio", "fecha_emision", "nit_emisor", "nit_receptor", "total") if n not in df.columns]
+    if faltan: raise ValueError("El archivo no parece el reporte de documentos de la DIAN. Faltan estas columnas: " + ", ".join(faltan))
+    for c in ("prefijo", "proveedor", "estado", "cufe", "fecha_recepcion"):
+        if c not in df.columns: df[c] = ""
+    df = df.fillna("")
+    es_evento = df["tipo"].str.lower().str.contains("application response")
+    docs = df[~es_evento].copy()
+    solo = lambda x: re.sub(r"\D", "", str(x))
+    docs["nit_emisor"], docs["nit_receptor"] = docs["nit_emisor"].map(solo), docs["nit_receptor"].map(solo)
+    docs["numero"] = docs["prefijo"].str.strip() + docs["folio"].str.strip()
+    docs["clave"], docs["folio_num"] = docs["numero"].map(solo), docs["folio"].map(solo)   # la app guarda prefijo+folio SOLO con dígitos
+    f1 = pd.to_datetime(docs["fecha_emision"], format="%d-%m-%Y", errors="coerce")
+    docs["fecha"] = f1.fillna(pd.to_datetime(docs["fecha_emision"], dayfirst=True, errors="coerce")).dt.strftime("%Y-%m-%d").fillna("")
+    docs["total_num"] = pd.to_numeric(docs["total"].str.replace(",", "", regex=False), errors="coerce").fillna(0.0)
+    otros = 0
+    if tenant_nit:
+        mask = docs["nit_receptor"] == solo(tenant_nit); otros = int((~mask).sum()); docs = docs[mask]
+    fechas = docs["fecha"][docs["fecha"] != ""]
+    info = {"filas": int(len(df)), "acuses_ignorados": int(es_evento.sum()), "documentos": int(len(docs)), "otros_receptores": otros,
+            "periodo": (fechas.min() if len(fechas) else None, fechas.max() if len(fechas) else None), "por_tipo": docs["tipo"].value_counts().to_dict()}
+    return docs.reset_index(drop=True), info
+
+def conciliar_dian(tenant_nit, dian):
+    """Cruza los documentos de la DIAN con TODO lo que hay en la app (bandeja, causadas y tesorería). Solo consulta; no modifica nada."""
+    solo = lambda x: re.sub(r"\D", "", str(x or ""))
+    conn = get_db_connection(); c = conn.cursor()
+    try:
+        c.execute("SELECT id, estado, data FROM docs WHERE tenant_nit=? AND tipo=?", (tenant_nit, "FC")); docs_rows = c.fetchall()
+        c.execute("SELECT doc_ref, nit_proveedor, fecha, proveedor FROM history WHERE tenant_nit=? AND tipo=?", (tenant_nit, "FC")); hist_rows = c.fetchall()
+        c.execute("SELECT doc_ref, nit_proveedor FROM treasury WHERE tenant_nit=?", (tenant_nit,)); teso_rows = c.fetchall()
+    finally: conn.close()
+    idx, totales_app, candidatos = {}, {}, []
+    def add(nit, ref, lugar): idx.setdefault((solo(nit), solo(ref)), []).append(lugar)
+    for id_, estado, data in docs_rows:
+        p = str(id_).split("_", 3)
+        if len(p) < 4: continue
+        add(p[2], p[3], f"Bandeja: {estado}")
+        try: r = json.loads(data).get("Resumen", {})
+        except Exception: r = {}
+        tot = float(r.get("Total") or 0); totales_app[(solo(p[2]), solo(p[3]))] = tot
+        candidatos.append({"Dónde está": f"Bandeja: {estado}", "Fecha": str(r.get("Fecha", ""))[:10], "Documento": p[3], "NIT": solo(p[2]), "Proveedor": r.get("Proveedor", ""), "Total": tot, "_k": (solo(p[2]), solo(p[3]))})
+    for ref, nit, fecha, prov in hist_rows:
+        add(nit, ref, "Causada en Siigo")
+        candidatos.append({"Dónde está": "Causada en Siigo", "Fecha": str(fecha)[:10], "Documento": ref, "NIT": solo(nit), "Proveedor": prov or "", "Total": None, "_k": (solo(nit), solo(ref))})
+    for ref, nit in teso_rows: add(nit, ref, "Tesorería")
+    faltan, estan, difs, dian_keys = [], [], [], set()
+    for r in dian.to_dict("records"):
+        clave, nit = r["clave"], r["nit_emisor"]
+        dian_keys.update({(nit, clave), (nit, r["folio_num"])})
+        lugares, por_folio = idx.get((nit, clave)), False
+        if not lugares and r["folio_num"] and r["folio_num"] != clave:
+            lugares = idx.get((nit, r["folio_num"])); por_folio = bool(lugares)
+        base = {"Fecha emisión": r["fecha"], "Tipo": r["tipo"], "Documento": r["numero"], "NIT emisor": nit, "Proveedor": r["proveedor"], "Total DIAN": r["total_num"],
+                "Estado DIAN": r["estado"], "Recibido": str(r["fecha_recepcion"])[:16].replace("T", " ")}
+        if not lugares: faltan.append(base); continue
+        estan.append({**base, "Dónde está en la app": " + ".join(dict.fromkeys(lugares)) + (" (coincidencia solo por folio)" if por_folio else "")})
+        k = (nit, r["folio_num"] if por_folio else clave)
+        if k in totales_app:   # el valor solo se compara con la bandeja (ahí el total es el de la factura)
+            dif = r["total_num"] - totales_app[k]
+            if abs(dif) > 1.0: difs.append({**base, "Total en la app": totales_app[k], "Diferencia": round(dif, 2)})
+    fechas = [x for x in dian["fecha"] if x]
+    pmin, pmax = (min(fechas), max(fechas)) if fechas else ("", "")
+    solo_app = [{k: v for k, v in x.items() if k != "_k"} for x in candidatos if pmin and pmin <= x["Fecha"] <= pmax and x["_k"] not in dian_keys]
+    ordenar = lambda lst: pd.DataFrame(sorted(lst, key=lambda x: (str(x.get("Fecha emisión", x.get("Fecha", ""))), str(x.get("Documento", ""))), reverse=True))
+    return {"faltan": ordenar(faltan), "estan": ordenar(estan), "diferencias": ordenar(difs), "solo_app": ordenar(solo_app), "periodo": (pmin, pmax), "total": int(len(dian))}
+
+def excel_conciliacion(res):
+    out = io.BytesIO()
+    with pd.ExcelWriter(out, engine="openpyxl") as w:
+        for nombre, df in (("Faltan en la app", res["faltan"]), ("Ya están en la app", res["estan"]), ("Diferencias de valor", res["diferencias"]), ("En la app y no en la DIAN", res["solo_app"])):
+            (df if len(df) else pd.DataFrame({"Sin resultados": []})).to_excel(w, index=False, sheet_name=nombre[:31])
+    return out.getvalue()
 
 # ==========================================
 # 1. CONFIGURACIÓN Y ESTILOS SAAS
@@ -1740,6 +1829,7 @@ auto_clean_processed_docs(curr_tenant_nit)
 
 can_upload  = curr_rol in ['SuperAdmin', 'Administrador', 'Administrativo', 'Auxiliar Administrativo']
 can_approve = curr_rol in ['SuperAdmin', 'Administrador', 'Administrativo']
+puede_conciliar_dian = curr_rol in ['SuperAdmin', 'Administrador', 'Administrativo', 'Asistente Contable']   # panel de conciliación con la DIAN (solo lectura)
 can_cause   = curr_rol in ['SuperAdmin', 'Administrador', 'Asistente Contable']
 can_config  = curr_rol in ['SuperAdmin']
 can_admin   = curr_rol in ['SuperAdmin', 'Administrador']
@@ -1759,12 +1849,14 @@ _menu_todas = [
     "📊 6. Tablero Audit (Ajustes)", 
     "📈 7. Reportes y Excel", 
     "💰 8. Tesorería (CXP & Pagos)",
+    "🏛️ Conciliación DIAN",
     "⚙️ Configuración Empresa"
 ]
 def _menu_visible(m):
     if any(k in m for k in ("2. Causación", "3. Causación", "4. Documentos Soporte")): return can_cause
     if "6. Tablero" in m: return can_cause or can_approve
     if "Configuración Empresa" in m: return can_admin
+    if "Conciliación DIAN" in m: return puede_conciliar_dian
     return True
 menu_opciones = [m for m in _menu_todas if _menu_visible(m)]
 panel_seleccionado = st.sidebar.radio("Navegación:", menu_opciones)
@@ -3077,6 +3169,48 @@ elif panel_seleccionado == "💰 8. Tesorería (CXP & Pagos)":
 # ----------------------------------------------------
 # PANEL 9: CONFIGURACIÓN MULTI-EMPRESA & USUARIOS
 # ----------------------------------------------------
+elif panel_seleccionado == "🏛️ Conciliación DIAN":
+    if not puede_conciliar_dian: st.warning("🔒 Acceso denegado.")
+    else:
+        page_title("🏛️ Conciliación con el reporte de la DIAN")
+        st.caption("Sube el Excel de documentos recibidos que bajas de la DIAN con tu token. La app lo cruza con lo que ya tiene (bandeja, causadas y tesorería) y te dice qué documentos faltan. **Solo lee: no carga, no modifica ni borra nada.** Las filas «Application response» (acuses de la DIAN) se ignoran.")
+        up_dian = st.file_uploader("Reporte de la DIAN (Excel .xlsx)", type=["xlsx"], key="up_dian")
+        if up_dian is not None:
+            llave_dian = f"{curr_tenant_nit}_{up_dian.name}_{up_dian.size}"
+            dian_df, dian_info = None, None
+            try: dian_df, dian_info = leer_reporte_dian(up_dian.getvalue(), curr_tenant_nit)
+            except ValueError as e_dian: st.error(f"❌ {e_dian}")
+            if dian_df is not None:
+                m1, m2, m3, m4 = st.columns(4)
+                m1.metric("Filas del reporte", f"{dian_info['filas']:,}")
+                m2.metric("Acuses ignorados", f"{dian_info['acuses_ignorados']:,}")
+                m3.metric("Documentos a conciliar", f"{dian_info['documentos']:,}")
+                m4.metric("Periodo (emisión)", f"{dian_info['periodo'][0] or '—'} → {dian_info['periodo'][1] or '—'}")
+                if dian_info["otros_receptores"]: st.warning(f"⚠️ {dian_info['otros_receptores']} documento(s) del reporte son de OTRO receptor (no de esta empresa) y se dejaron fuera del cruce.")
+                if dian_df.empty: st.info("El reporte no trae facturas ni notas para esta empresa (solo acuses u otros receptores).")
+                else:
+                    if st.button("🔍 Conciliar con la app", type="primary", key="btn_conc_dian"):
+                        with st.spinner("Cruzando el reporte con la app..."): st.session_state["conc_dian"] = {"llave": llave_dian, "res": conciliar_dian(curr_tenant_nit, dian_df)}
+                    cd = st.session_state.get("conc_dian")
+                    if cd and cd["llave"] == llave_dian:
+                        res = cd["res"]
+                        r1, r2, r3, r4 = st.columns(4)
+                        r1.metric("❌ Faltan en la app", len(res["faltan"])); r2.metric("✅ Ya están", len(res["estan"])); r3.metric("⚖️ Diferencias de valor", len(res["diferencias"])); r4.metric("🔎 En la app, no en el reporte", len(res["solo_app"]))
+                        if len(res["faltan"]) == 0: st.success("🎉 Todo lo que la DIAN reporta ya está en la app.")
+                        st.download_button("📥 Descargar la conciliación (Excel)", data=excel_conciliacion(res), file_name=f"Conciliacion_DIAN_{curr_tenant_nit}.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+                        t_f, t_e, t_d, t_s = st.tabs([f"❌ Faltan en la app ({len(res['faltan'])})", f"✅ Ya están ({len(res['estan'])})", f"⚖️ Diferencias de valor ({len(res['diferencias'])})", f"🔎 En la app, no en el reporte ({len(res['solo_app'])})"])
+                        with t_f:
+                            st.caption("Documentos que la DIAN dice que recibiste y que NO están en la app (ni en bandeja, ni causados, ni en tesorería). Pide el XML al proveedor o búscalo en el correo.")
+                            if len(res["faltan"]): st.dataframe(res["faltan"], use_container_width=True, hide_index=True)
+                        with t_e: 
+                            if len(res["estan"]): st.dataframe(res["estan"], use_container_width=True, hide_index=True)
+                        with t_d:
+                            st.caption("El total que reporta la DIAN no coincide con el de la factura en la bandeja (más de $1). Se compara solo con lo que está en la bandeja.")
+                            if len(res["diferencias"]): st.dataframe(res["diferencias"], use_container_width=True, hide_index=True)
+                        with t_s:
+                            st.caption("Solo para revisar: están en la app con fecha dentro del periodo del reporte, pero no aparecen en él. Puede ser un reporte de otro rango o un documento que no llegó a la DIAN.")
+                            if len(res["solo_app"]): st.dataframe(res["solo_app"], use_container_width=True, hide_index=True)
+
 elif panel_seleccionado == "⚙️ Configuración Empresa":
     if not can_admin: st.warning("🔒 Acceso denegado. Solo administradores.")
     else:
