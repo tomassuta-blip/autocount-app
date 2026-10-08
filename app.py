@@ -579,7 +579,11 @@ DEFAULT_PUC = [
     "51357001 - Asesoría Jurídica y Financiera", "51359501 - Otros Servicios Diversos", "23651501 - Retención en la Fuente - Honorarios / Servicios"
 ]
 
-OPCIONES_CLASIFICACION = ["Proveedor", "Nómina de Servicios", "Reembolso", "Ser.Publicos", "Viajes"]
+OPCIONES_CLASIFICACION = [
+    "Proveedor", "Nómina de Servicios", "Reembolso", "Ser.Publicos", "Viajes",   # originales: no cambiar orden ni texto (index=0 = "Proveedor" es el valor por defecto)
+    "Anticipo", "Arrendamiento", "Cliente", "Colaborador", "Devolucion", "Estado de cuenta",
+    "Licencia", "Implementacion", "People", "Polizas", "Temporales",
+]
 
 # ==========================================
 # 2. FUNCIONES BASE Y DE UTILIDAD
