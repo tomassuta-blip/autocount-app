@@ -265,6 +265,41 @@ def fecha_emision_rapida(nombre, datos):
         return (min(fechas), max(fechas)) if fechas else None
     except Exception: return None
 
+def archivar_en_drive(web_app_url, nombres):
+    """Le pide al script de Drive MOVER (no borrar) esos archivos a la carpeta «Facturas_AutoCount_Procesadas».
+    Devuelve (movidos, aviso). Si algo falla, no pasa nada grave: los archivos simplemente siguen en su carpeta."""
+    nombres = [n for n in dict.fromkeys(nombres) if re.fullmatch(r"FAC_[A-Za-z0-9]+_\d+\.(zip|xml)", str(n), re.I)]
+    movidos = 0
+    for i in range(0, len(nombres), 40):
+        try:
+            # 'diagnostico' evita que un script ANTIGUO (que no entiende 'archivar') responda enviando todos los archivos
+            r = requests.get(web_app_url, params={"archivar": ",".join(nombres[i:i + 40]), "diagnostico": "1"}, timeout=120)
+            j = r.json()
+        except Exception as e:
+            return movidos, f"No se pudo mover a «Procesadas» ({str(e)[:100]}). Los archivos siguen en Drive; no se perdió nada."
+        if not (isinstance(j, dict) and "movidos" in j):
+            return movidos, "El script de Drive publicado es una versión anterior y no sabe mover a «Procesadas». Pega el script nuevo y publica una nueva versión."
+        movidos += int(j.get("movidos") or 0)
+    return movidos, ""
+
+def _clave_fc(item):
+    try: r = item["Resumen"]; return (str(r["ID"]), re.sub(r"\D", "", str(r["NIT"])))
+    except Exception: return None
+
+def archivos_drive_ya_cargados(info, fuera, usar_rango, desde):
+    """Nombres de archivos de Drive que ya no hace falta volver a leer: sus facturas quedaron registradas en la app, o son anteriores al rango.
+    NO incluye: archivos sin ninguna factura (acuses, errores de lectura: se dejan para revisarlos) ni facturas posteriores al rango."""
+    retenidas = set()
+    for it in fuera:
+        f = str((it.get("Resumen") or {}).get("Fecha", ""))[:10]
+        if usar_rango and desde and f and f < str(desde): continue          # anterior al rango: se puede archivar
+        retenidas.add(_clave_fc(it))
+    out = []
+    for x in info or []:
+        if x["claves"] is None: out.append(x["f"])                           # claramente anterior al rango (se omitió sin leer)
+        elif x["claves"] and not any(c in retenidas for c in x["claves"]): out.append(x["f"])
+    return out
+
 def db_ids_ya_procesados(tenant_nit):
     """Un solo viaje a la base: ids ya causados (historial) y {id: estado} de lo ya registrado en la bandeja."""
     conn = get_db_connection(); c = conn.cursor()
@@ -311,8 +346,10 @@ def mostrar_resultado_recepcion(tipo):
         if res.get("omitidos"): partes.append(f"⏭️ Omitidos por fecha, sin leer: **{res['omitidos']}**")
         _t = {k: v for k, v in (res.get("tiempos") or {}).items() if v is not None}
         if _t: partes.append("⏱ " + " · ".join(f"{k} {v} s" for k, v in _t.items()))
+        if res.get("archivados"): partes.append(f"🧹 Movidos a «Procesadas»: **{res['archivados']}**")
         if res.get("origen"): partes.insert(0, f"Origen: **{res['origen']}**")
         (st.success if res["added"] > 0 else st.warning)("  ·  ".join(partes))
+        if res.get("aviso_archivado"): st.warning("⚠️ " + res["aviso_archivado"])
         if res["skipped"]: st.warning("⚠️ **Ya estaban registrados:**\n" + "\n".join([f"* {i}" for i in res["skipped"]]))
     fuera = st.session_state.get(k_fuera) or []
     if fuera:
@@ -859,6 +896,8 @@ _DDL_TABLAS = [
     'CREATE TABLE IF NOT EXISTS docs (id TEXT PRIMARY KEY, tenant_nit TEXT, doc_ref TEXT, tipo TEXT, estado TEXT, data TEXT)',
     'CREATE TABLE IF NOT EXISTS history (id TEXT PRIMARY KEY, tenant_nit TEXT, doc_ref TEXT, tipo TEXT, fecha TEXT, total REAL, moneda TEXT, siigo_id TEXT, proveedor TEXT, nit_proveedor TEXT, pdf_b64 TEXT, data_json TEXT, usuario TEXT)',
     'CREATE TABLE IF NOT EXISTS treasury (id TEXT PRIMARY KEY, tenant_nit TEXT, doc_ref TEXT, proveedor TEXT, nit_proveedor TEXT, fecha_recibido TEXT, fecha_vencimiento TEXT, concepto TEXT, centro_costo TEXT, valor_con_iva REAL, total_pagar REAL, estado TEXT, clasificacion TEXT, fecha_propuesta TEXT, observacion TEXT, fecha_pago TEXT, banco_girador TEXT, raw_data TEXT)',
+    # Bitácora de anulaciones de causación (quién, cuándo, por qué y una copia de lo que se quitó)
+    'CREATE TABLE IF NOT EXISTS anulaciones (id TEXT PRIMARY KEY, tenant_nit TEXT, fecha TEXT, usuario TEXT, tipo TEXT, doc_ref TEXT, proveedor TEXT, nit_proveedor TEXT, siigo_num TEXT, siigo_id TEXT, destino TEXT, motivo TEXT, verificacion_siigo TEXT, snapshot TEXT)',
 ]
 
 # Cambios de esquema para bases YA existentes (se aplican una sola vez; si la columna ya existe no pasa nada).
@@ -1119,12 +1158,89 @@ def db_get_treasury(tenant_nit):
         })
     return res
 
+_COLS_TESORERIA = ["id", "doc_ref", "proveedor", "nit_proveedor", "fecha_recibido", "fecha_vencimiento", "concepto", "centro_costo", "valor_con_iva", "total_pagar", "estado", "clasificacion", "fecha_propuesta", "observacion", "fecha_pago", "banco_girador", "raw_data"]
+
+def db_anular_causacion(tenant_nit, hist_record, destino, motivo, usuario, verificacion_siigo=""):
+    """Deshace una causación SOLO DENTRO DE LA APP (no toca Siigo): quita el documento del Histórico y de Tesorería y lo devuelve a
+    «Aprobado» (listo para volver a causar) o a «Pendiente» (Recepción). Todo en una sola transacción: o se hace completo o no se hace nada.
+    destino: "causar" | "recepcion". Devuelve (True, nombre del panel donde quedó) o (False, motivo del rechazo)."""
+    tipo, doc_ref = hist_record["tipo"], str(hist_record["id_doc_prov"])
+    nit_hist = re.sub(r'\D', '', str(hist_record["nit"]))
+    hist_id = f"{tenant_nit}_{tipo}_{nit_hist}_{doc_ref}"
+    data_original = hist_record.get("data_json") or "{}"
+    try: doc = json.loads(data_original)
+    except Exception: doc = {}
+    es_fc = (tipo == "FC")
+    meta = doc.get("Resumen") if (es_fc and isinstance(doc, dict)) else doc
+    if not isinstance(doc, dict) or not doc or not isinstance(meta, dict):
+        return False, "Los datos guardados de esta causación no se pueden leer; no se puede reabrir."
+    clave_estado = "Estado" if es_fc else "estado"
+    clasif = meta.get("Clasificacion")
+
+    if destino == "causar":
+        if clasif not in ("CXP", "Tarjeta"): return False, "Este documento no tiene guardado su destino (CXP o Tarjeta). Usa «A Recepción»."
+        estado_doc = "Aprobado"; meta[clave_estado] = "Aprobado"
+        panel = "Documentos Soporte (DS)" if not es_fc else ("Causación Siigo (CXP)" if clasif == "CXP" else "Causación Tarjetas")
+    else:
+        estado_doc = "Pendiente"; meta[clave_estado], meta["Clasificacion"] = "Pendiente", ""
+        for k in ("UsuarioAprobador", "FechaAprobacion"): meta.pop(k, None)
+        if "Estado" in doc: doc["Estado"] = "Pendiente"
+        if "Clasificacion" in doc: doc["Clasificacion"] = ""
+        panel = "Recepción & Aprobación (Pendientes)"
+    for k in ("UsuarioCausador", "FechaCausacion"): doc.pop(k, None)
+    if not es_fc and "causado" in doc: doc["causado"] = False
+    if not doc.get("pdf_b64") and hist_record.get("pdf_original"):          # el Histórico guarda el PDF aparte: se devuelve al documento
+        doc["pdf_b64"] = base64.b64encode(hist_record["pdf_original"]).decode("utf-8")
+
+    # El documento se guarda con el MISMO id con que nació en Recepción (NIT y número del propio documento)
+    ref_doc = str((meta.get("ID") if es_fc else doc.get("documento_ref")) or doc_ref)
+    nit_doc = re.sub(r'\D', '', str((meta.get("NIT") if es_fc else doc.get("nit")) or hist_record["nit"]))
+    doc_id = f"{tenant_nit}_{tipo}_{nit_doc}_{ref_doc}"
+    solo = lambda v: re.sub(r'\D', '', str(v or ""))
+    num_siigo, _, id_siigo = str(hist_record.get("id_siigo_num") or "").partition("|||")
+
+    conn = get_db_connection(); c = conn.cursor()
+    try:
+        c.execute(f"SELECT {', '.join(_COLS_TESORERIA)} FROM treasury WHERE tenant_nit=? AND nit_proveedor=?", (tenant_nit, nit_hist))
+        filas_t = [dict(zip(_COLS_TESORERIA, r)) for r in c.fetchall() if solo(r[1]) == solo(doc_ref)]
+        pagadas = [t for t in filas_t if str(t.get("estado") or "").strip().lower() == "pagado" and "tarjeta" not in str(t.get("banco_girador") or "").lower()]
+        if pagadas:
+            return False, f"En Tesorería esta factura ya figura como PAGADA ({pagadas[0].get('banco_girador') or 'sin banco'}, {pagadas[0].get('fecha_pago') or 'sin fecha'}). Primero revierte ese pago en Tesorería."
+        snapshot = json.dumps({"historial": {k: hist_record.get(k) for k in ("id_doc_prov", "tipo", "fecha", "total", "moneda", "id_siigo_num", "proveedor", "nit", "usuario")},
+                               "data_json": data_original, "tesoreria": filas_t}, default=str)
+        c.execute("DELETE FROM history WHERE id=?", (hist_id,))
+        for t in filas_t: c.execute("DELETE FROM treasury WHERE id=?", (t["id"],))
+        c.execute("DELETE FROM docs WHERE id=?", (hist_id,))
+        c.execute("INSERT OR REPLACE INTO docs (id, tenant_nit, doc_ref, tipo, estado, data) VALUES (?,?,?,?,?,?)", (doc_id, tenant_nit, ref_doc, tipo, estado_doc, json.dumps(doc)))
+        c.execute("INSERT INTO anulaciones (id, tenant_nit, fecha, usuario, tipo, doc_ref, proveedor, nit_proveedor, siigo_num, siigo_id, destino, motivo, verificacion_siigo, snapshot) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                  (f"{tenant_nit}_{int(time.time() * 1000)}", tenant_nit, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), usuario, tipo, doc_ref, hist_record.get("proveedor", ""), nit_hist,
+                   num_siigo, id_siigo, destino, motivo, verificacion_siigo, snapshot))
+        conn.commit()
+    except Exception as e:
+        try: conn.rollback()
+        except Exception: pass
+        return False, f"No se pudo anular (no se cambió nada): {e}"
+    finally:
+        try: conn.close()
+        except Exception: pass
+    return True, panel
+
+def db_get_anulaciones(tenant_nit):
+    try:
+        conn = get_db_connection(); c = conn.cursor()
+        try:
+            c.execute("SELECT fecha, usuario, tipo, doc_ref, proveedor, siigo_num, destino, motivo, verificacion_siigo FROM anulaciones WHERE tenant_nit=? ORDER BY fecha DESC", (tenant_nit,))
+            return c.fetchall()
+        finally: conn.close()
+    except Exception: return []
+
 _TABLAS_RESPALDO = {  # tabla: (llave primaria, columnas)
     "tenants": ("nit", ["nit", "razon_social", "siigo_user", "siigo_key", "puc"]),
     "users": ("email", ["email", "password", "nombre", "tenant_nit", "rol", "activo"]),
     "docs": ("id", ["id", "tenant_nit", "doc_ref", "tipo", "estado", "data"]),
     "history": ("id", ["id", "tenant_nit", "doc_ref", "tipo", "fecha", "total", "moneda", "siigo_id", "proveedor", "nit_proveedor", "pdf_b64", "data_json", "usuario"]),
     "treasury": ("id", ["id", "tenant_nit", "doc_ref", "proveedor", "nit_proveedor", "fecha_recibido", "fecha_vencimiento", "concepto", "centro_costo", "valor_con_iva", "total_pagar", "estado", "clasificacion", "fecha_propuesta", "observacion", "fecha_pago", "banco_girador", "raw_data"]),
+    "anulaciones": ("id", ["id", "tenant_nit", "fecha", "usuario", "tipo", "doc_ref", "proveedor", "nit_proveedor", "siigo_num", "siigo_id", "destino", "motivo", "verificacion_siigo", "snapshot"]),
 }
 
 def exportar_respaldo_sqlite():
@@ -1296,6 +1412,19 @@ def crear_tercero_express_siigo(nit, nombre, tenant_nit, siigo_user, siigo_key, 
         else: return False, f"❌ Error Siigo API ({res.status_code}): {res.text}"
     except Exception as e: return False, f"❌ Error de Conexión: {e}"
 
+def siigo_documento_existe(siigo_id, tipo, tenant_nit, siigo_user, siigo_key):
+    """Pregunta a Siigo si el documento todavía existe (solo CONSULTA, no cambia nada).
+    Devuelve (estado, detalle): estado = 'existe' | 'no_existe' | 'no_verificado'. Solo un 404 cuenta como «ya no existe»."""
+    if not siigo_id: return "no_verificado", "No se guardó el identificador de Siigo de este documento."
+    headers, err = get_siigo_headers(tenant_nit, siigo_user, siigo_key)
+    if not headers: return "no_verificado", f"No se pudo conectar con Siigo ({err})."
+    base = "https://api.siigo.com/v1/purchase-support-documents" if tipo == "DS" else "https://api.siigo.com/v1/purchases"
+    try: r = requests.get(f"{base}/{siigo_id}", headers=headers, timeout=15)
+    except Exception as e: return "no_verificado", f"Error de red: {e}"
+    if r.status_code == 200: return "existe", ""
+    if r.status_code == 404: return "no_existe", ""
+    return "no_verificado", f"Siigo respondió {r.status_code}: {r.text[:160]}"
+
 def causar_en_siigo_api(payload, is_ds, tenant_nit, siigo_user, siigo_key):
     headers, err = get_siigo_headers(tenant_nit, siigo_user, siigo_key)
     if not headers: return False, f"No Token: {err}", None, None, None
@@ -1435,19 +1564,25 @@ def extraer_facturas_desde_drive_cloud(web_app_url, data_list, tenant_nit=None, 
                 if filtros == {""}: aviso = "El script de Drive publicado es una versión ANTERIOR: no entiende el rango y devolvió todo. Pega el script nuevo y publica una NUEVA VERSIÓN (Implementar > Administrar implementaciones > lápiz > Nueva versión)."
                 elif fallos: aviso = f"El script no pudo consultar Gmail ({fallos[0][13:].strip()}) y devolvió los archivos SIN filtrar por correo. Ejecuta guardarFacturasEnDrive una vez desde el editor de Apps Script (acepta los permisos de Gmail) y publica una nueva versión."
             if stats is not None: stats["aviso_script"] = aviso
-            t1, omitidos = time.time(), 0
+            t1, omitidos, info_arch = time.time(), 0, []
             lim_ini, lim_fin = ((desde - timedelta(days=7)).strftime("%Y-%m-%d"), (hasta + timedelta(days=7)).strftime("%Y-%m-%d")) if (desde and hasta) else (None, None)
             for item in archivos:
                 fname = item.get("filename", "factura.zip")
                 b64_str = item.get("base64", "")
                 if not b64_str: continue
-                if desde and archivo_drive_fuera_de_rango(item, desde): omitidos += 1; continue
+                if desde and archivo_drive_fuera_de_rango(item, desde): omitidos += 1; info_arch.append({"f": fname, "claves": None}); continue
                 datos = safe_b64decode(b64_str)
                 if lim_ini:
                     f_ = fecha_emision_rapida(fname, datos)
-                    if f_ and (f_[1] < lim_ini or f_[0] > lim_fin): omitidos += 1; continue
+                    # solo se marca como archivable lo ANTERIOR al rango; lo posterior (fecha futura) se omite pero se deja donde está
+                    if f_ and (f_[1] < lim_ini or f_[0] > lim_fin):
+                        omitidos += 1
+                        if f_[1] < lim_ini: info_arch.append({"f": fname, "claves": None})
+                        continue
+                n0 = len(data_list)
                 process_bytes(fname, datos, data_list, tenant_nit=tenant_nit)
-            if stats is not None: stats["omitidos_fecha"], stats["seg_lectura"] = omitidos, round(time.time() - t1, 1)
+                info_arch.append({"f": fname, "claves": [_clave_fc(x) for x in data_list[n0:]]})
+            if stats is not None: stats["omitidos_fecha"], stats["seg_lectura"], stats["archivos_info"] = omitidos, round(time.time() - t1, 1), info_arch
             msg = f"Se leyeron {len(archivos) - omitidos} de {len(archivos)} archivo(s) desde Drive."
             if omitidos: msg += f" {omitidos} fuera del rango de fechas se omitieron sin leerlos."
             if fechas: msg += f" Fechas de los archivos recibidos: {fechas[0]} → {fechas[-1]}."
@@ -1502,6 +1637,17 @@ def procesar_excel_puc(file_obj):
                 if code_digits and val_name.lower() != "nan" and es_transaccional and es_activa: puc_list.append(f"{code_digits} - {val_name}")
         return list(dict.fromkeys(puc_list)) if puc_list else None
     except Exception: return None
+
+def _precio_unitario_linea(item):
+    """Precio UNITARIO de una línea para el editor de causación. Antes se mostraba el total de la línea («Subtotal»),
+    y como luego se multiplica por la cantidad, las líneas con cantidad > 1 quedaban infladas."""
+    try:
+        cant = float(item.get("Cantidad", 1) or 1)
+        pu = float(item.get("Valor Unitario") or 0)
+        if pu > 0: return pu
+        sub = float(item.get("Subtotal", 0) or 0)
+        return round(sub / cant, 6) if cant else sub
+    except Exception: return 0.0
 
 def generar_comprobante_pdf(hist_record, tenant_razon_social, tenant_nit):
     pdf = FPDF(orientation='L', unit='mm', format='A4')
@@ -1754,6 +1900,49 @@ def modal_ajuste_ica(hist_record, maestros, curr_tenant_puc, tenant_nit, siigo_u
                         print(f"[Webhook Sheets] Error armando ajuste: {_e_adj}")
                     st.success(msg); st.balloons(); st.rerun()
                 else: st.error(msg)
+
+@st.dialog("↩️ Anular causación")
+def modal_anular_causacion(hist_record, tenant_nit, siigo_user, siigo_key, curr_user_email):
+    tipo, ref = hist_record["tipo"], str(hist_record["id_doc_prov"])
+    num_siigo, _, id_siigo = str(hist_record.get("id_siigo_num") or "").partition("|||")
+    kk = tipo + "_" + re.sub(r'\W', '', ref) + "_" + re.sub(r'\D', '', str(hist_record["nit"]))
+    st.markdown(f"**{tipo}-{ref}** · {hist_record['proveedor']}")
+    st.caption(f"En Siigo: {num_siigo or 'sin número guardado'}")
+    st.info("Esto **limpia la factura en AutoCount** (Histórico y Tesorería) y la devuelve para causarla de nuevo. **No borra nada en Siigo**: la factura tiene que estar borrada allá primero, y la app lo verifica.")
+
+    caja_estado = st.container()
+    ck = f"anul_chk_{kk}"
+    if st.button("🔄 Verificar de nuevo en Siigo", key=f"anul_redo_{kk}"): st.session_state.pop(ck, None)
+    if ck not in st.session_state or (time.time() - st.session_state[ck][2]) > 60:
+        with st.spinner("Verificando en Siigo..."):
+            _e, _d = siigo_documento_existe(id_siigo, tipo, tenant_nit, siigo_user, siigo_key)
+        st.session_state[ck] = (_e, _d, time.time())
+    estado_siigo, detalle_siigo, _t = st.session_state[ck]
+    confirmado_manual = False
+    with caja_estado:
+        if estado_siigo == "existe":
+            st.error("🔴 Esta factura **todavía existe en Siigo**. Bórrala allá primero y luego pulsa «Verificar de nuevo».")
+        elif estado_siigo == "no_existe":
+            st.success("✅ Siigo confirma que la factura ya no existe. Se puede limpiar en AutoCount.")
+        else:
+            st.warning(f"⚠️ No pude verificarlo en Siigo. {detalle_siigo}")
+            confirmado_manual = st.checkbox("Confirmo que ya borré esta factura en Siigo", key=f"anul_conf_{kk}")
+
+    destino = st.radio("¿A dónde la devuelvo?", ["causar", "recepcion"], key=f"anul_dest_{kk}",
+                       format_func=lambda v: {"causar": "🏢 A Causación (conserva la aprobación, el destino y la clasificación)", "recepcion": "📥 A Recepción (pendiente de revisar y aprobar otra vez)"}[v])
+    st.caption("**A Causación** sirve si el error fue en lo que enviaste a Siigo (cuentas, retenciones, tercero, forma de pago, fecha). **A Recepción**, si hay que cambiar el destino (CXP o Tarjeta), la clasificación del gasto o el centro de costo.")
+    motivo = st.text_input("Motivo de la anulación (obligatorio)", key=f"anul_mot_{kk}")
+    st.caption("📄 La fila de la hoja de Google no se toca: si vuelves a causar la factura se actualiza sola; si no la vas a causar de nuevo, bórrala a mano.")
+
+    puede = (estado_siigo == "no_existe") or (estado_siigo == "no_verificado" and confirmado_manual)
+    if st.button("↩️ Anular y devolver", type="primary", use_container_width=True, key=f"anul_go_{kk}", disabled=(not puede) or (not motivo.strip())):
+        verif = "Siigo confirma que no existe" if estado_siigo == "no_existe" else f"Confirmado a mano por el usuario ({detalle_siigo})"
+        ok, res_msg = db_anular_causacion(tenant_nit, hist_record, destino, motivo.strip(), curr_user_email, verif)
+        if ok:
+            st.session_state.pop(ck, None)
+            st.session_state["flash_anulacion"] = f"✅ {tipo}-{ref} anulada y devuelta a «{res_msg}». Si no la ves, revisa el rango de fechas del filtro."
+            st.rerun()
+        else: st.error(res_msg)
 
 # ==========================================
 # 7. FLUJO DE AUTENTICACIÓN
@@ -2012,6 +2201,8 @@ elif panel_seleccionado == "📥 1. Recepción & Aprobación":
                 rango_desde_fc = f_r2.date_input("Desde", value=datetime.strptime(FECHA_MINIMA_RECEPCION, "%Y-%m-%d").date(), key="rango_fc_desde", disabled=not usar_rango_fc)
                 rango_hasta_fc = f_r3.date_input("Hasta", value=datetime.now().date(), key="rango_fc_hasta", disabled=not usar_rango_fc)
                 if usar_rango_fc and rango_desde_fc > rango_hasta_fc: st.warning("La fecha 'Desde' es posterior a 'Hasta': no se cargará ninguna factura.")
+                archivar_fc = st.checkbox("🧹 Mover a «Procesadas» en Drive lo que ya quedó cargado (sincroniza más rápido)", value=True, key="archivar_fc",
+                                          help="Después de sincronizar, los archivos que ya están en la app, o son anteriores al rango de fechas, se MUEVEN a la carpeta «Facturas_AutoCount_Procesadas» de tu Drive. No se borra nada y la próxima sincronización no los vuelve a descargar. Los que no produjeron ninguna factura se dejan donde están.")
 
                 c_btn1, c_btn2, c_btn3 = st.columns([2, 2, 1])
                 with c_btn1: btn_manual_fc = st.button("🚀 Procesar Archivos Subidos", type="primary", use_container_width=True)
@@ -2038,11 +2229,25 @@ elif panel_seleccionado == "📥 1. Recepción & Aprobación":
                     if exito_d and stats_drive.get("archivos", 0) - stats_drive.get("omitidos_fecha", 0) > 0 and not data_list:
                         st.warning(f"Drive devolvió {stats_drive['archivos']} archivo(s) ({stats_drive.get('detalle', '')}) pero ninguno produjo una factura. Pueden ser eventos de la DIAN (acuses), facturas emitidas a otro NIT, o archivos que no son XML/ZIP.")
 
+                # 🧹 Mover a «Procesadas» lo ya cargado. Se hace DESPUÉS de guardar en la base (si el guardado falla, no se mueve nada).
+                def _archivar_drive_fc(fuera_items):
+                    if not (origen_fc == "Google Drive" and archivar_fc and stats_drive.get("archivos_info")): return 0, ""
+                    nombres = archivos_drive_ya_cargados(stats_drive["archivos_info"], fuera_items, usar_rango_fc, rango_desde_fc)
+                    if not nombres: return 0, ""
+                    with st.spinner(f"Moviendo {len(nombres)} archivo(s) a «Procesadas»..."):
+                        return archivar_en_drive(url_api, nombres)
+
                 if data_list:
                     res_fc = guardar_lote_recepcion(curr_tenant_nit, data_list, "FC", usar_rango_fc, rango_desde_fc, rango_hasta_fc)
                     if origen_fc != "Google Drive": retener_fuera_de_rango("FC", res_fc["fuera"])   # de Drive no se retiene: los archivos siguen allí
-                    st.session_state['result_upload_fc'] = {"added": res_fc["added"], "skipped": res_fc["skipped"], "leidos": res_fc["leidos"], "n_fuera": len(res_fc["fuera"]), "origen": origen_fc, "omitidos": stats_drive.get("omitidos_fecha", 0), "tiempos": {"descarga": stats_drive.get("seg_descarga"), "lectura": stats_drive.get("seg_lectura"), "guardado": res_fc.get("seg_guardado")}}
+                    _arch_n, _arch_aviso = _archivar_drive_fc(res_fc["fuera"])
+                    st.session_state['result_upload_fc'] = {"added": res_fc["added"], "skipped": res_fc["skipped"], "leidos": res_fc["leidos"], "n_fuera": len(res_fc["fuera"]), "origen": origen_fc, "omitidos": stats_drive.get("omitidos_fecha", 0), "tiempos": {"descarga": stats_drive.get("seg_descarga"), "lectura": stats_drive.get("seg_lectura"), "guardado": res_fc.get("seg_guardado")}, "archivados": _arch_n, "aviso_archivado": _arch_aviso}
                     st.session_state['fc_up_key'] += 1; st.rerun()
+                elif origen_fc == "Google Drive" and exito_d and stats_drive.get("archivos_info"):
+                    # Nada que guardar (p. ej. todo era anterior al rango): igual se limpia lo claramente viejo
+                    _arch_n, _arch_aviso = _archivar_drive_fc([])
+                    if _arch_n: st.success(f"🧹 {_arch_n} archivo(s) anteriores al rango se movieron a «Procesadas» en Drive.")
+                    if _arch_aviso: st.warning("⚠️ " + _arch_aviso)
 
                 mostrar_resultado_recepcion("FC")
 
@@ -2314,7 +2519,7 @@ elif panel_seleccionado == "🏢 2. Causación Siigo (CXP)":
                             else: prod_sel = st.selectbox("Producto", options=prods_lista if prods_lista else ["Sin Productos"], key=f"fc_prod_{llave_factura}_{item_idx}", label_visibility="collapsed"); code_item = prod_sel.split(" - ")[0].strip()
                         with i3: desc_val = st.text_input("Descripción", value=item['Concepto'], key=f"fc_desc_{llave_factura}_{item_idx}", label_visibility="collapsed")
                         with i4: cant_val = st.number_input("Cant", value=float(item.get('Cantidad', 1.0)), key=f"fc_cant_{llave_factura}_{item_idx}", label_visibility="collapsed")
-                        with i5: monto_val = st.number_input("Vr. Unitario", value=float(item['Subtotal']), key=f"fc_val_{llave_factura}_{item_idx}", label_visibility="collapsed")
+                        with i5: monto_val = st.number_input("Vr. Unitario", value=_precio_unitario_linea(item), key=f"fc_val_{llave_factura}_{item_idx}", label_visibility="collapsed")
                         with i6:
                             iva_sel = st.selectbox("Imp. Cargo", options=[i["nombre"] for i in list_iva], index=buscar_indice_iva(item.get("IVA %", 0), list_iva), key=f"fc_iva_sel_{llave_factura}_{item_idx}", label_visibility="collapsed")
                             id_iva, pct_iva_sel = next((i["id"] for i in list_iva if i["nombre"] == iva_sel), 0), next((i["porcentaje"] for i in list_iva if i["nombre"] == iva_sel), 0.0)
@@ -2491,7 +2696,7 @@ elif panel_seleccionado == "💳 3. Causación Tarjetas":
                             code_item = re.sub(r'[^\d]', '', puc_sel.split(" - ")[0].strip())
                         with i3: desc_val = st.text_input("Descripción", value=item['Concepto'], key=f"fc_desc_{llave_factura}_{item_idx}", label_visibility="collapsed")
                         with i4: cant_val = st.number_input("Cant", value=float(item.get('Cantidad', 1.0)), key=f"fc_cant_{llave_factura}_{item_idx}", label_visibility="collapsed")
-                        with i5: monto_val = st.number_input("Vr. Unitario", value=float(item['Subtotal']), key=f"fc_val_{llave_factura}_{item_idx}", label_visibility="collapsed")
+                        with i5: monto_val = st.number_input("Vr. Unitario", value=_precio_unitario_linea(item), key=f"fc_val_{llave_factura}_{item_idx}", label_visibility="collapsed")
                         with i6:
                             iva_sel = st.selectbox("Imp. Cargo", options=[i["nombre"] for i in list_iva], index=buscar_indice_iva(item.get("IVA %", 0), list_iva), key=f"fc_iva_sel_{llave_factura}_{item_idx}", label_visibility="collapsed")
                             id_iva, pct_iva_sel = next((i["id"] for i in list_iva if i["nombre"] == iva_sel), 0), next((i["porcentaje"] for i in list_iva if i["nombre"] == iva_sel), 0.0)
@@ -2801,6 +3006,12 @@ elif panel_seleccionado == "📦 5. Caja Menor":
 # ----------------------------------------------------
 elif panel_seleccionado == "📊 6. Tablero Audit (Ajustes)":
     page_title("📊 Histórico de Causaciones (Siigo)")
+    if st.session_state.get("flash_anulacion"): st.success(st.session_state.pop("flash_anulacion"))
+    if can_admin:
+        _anul = db_get_anulaciones(curr_tenant_nit)
+        if _anul:
+            with st.expander(f"🧾 Anulaciones registradas ({len(_anul)})", expanded=False):
+                st.dataframe(pd.DataFrame(_anul, columns=["Fecha", "Usuario", "Tipo", "Documento", "Proveedor", "No. Siigo", "Devuelta a", "Motivo", "Verificación en Siigo"]), use_container_width=True, hide_index=True)
     hist = db_get_history(curr_tenant_nit)
     if not hist: st.info("No hay documentos causados en la base de datos para esta empresa.")
     else:
@@ -2829,6 +3040,7 @@ elif panel_seleccionado == "📊 6. Tablero Audit (Ajustes)":
                 with c5:
                     if c["tipo"] == "FC":
                         if can_cause and st.button("⚖️ Ajuste CC (ReteICA)", key=f"btn_adj_ica_{c['id_doc_prov']}_{c['tipo']}", use_container_width=True): modal_ajuste_ica(c, maestros, curr_tenant.get('puc', DEFAULT_PUC), curr_tenant_nit, curr_tenant['siigo_user'], curr_tenant['siigo_key'], curr_user['email'])
+                    if can_admin and st.button("↩️ Anular causación", key=f"btn_anul_{idx}_{c['tipo']}_{c['id_doc_prov']}", use_container_width=True): modal_anular_causacion(c, curr_tenant_nit, curr_tenant['siigo_user'], curr_tenant['siigo_key'], curr_user['email'])
 
 # ----------------------------------------------------
 # PANEL 7: REPORTES Y EXPORTACIONES
