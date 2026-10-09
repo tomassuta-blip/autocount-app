@@ -1425,6 +1425,17 @@ def siigo_documento_existe(siigo_id, tipo, tenant_nit, siigo_user, siigo_key):
     if r.status_code == 404: return "no_existe", ""
     return "no_verificado", f"Siigo respondió {r.status_code}: {r.text[:160]}"
 
+def siigo_borrar_documento(siigo_id, tipo, tenant_nit, siigo_user, siigo_key):
+    """Pide a Siigo BORRAR el documento (DELETE). Devuelve (ok, mensaje). Si Siigo lo rechaza, no cambia nada en la app y se muestra su respuesta tal cual."""
+    if not siigo_id: return False, "No se guardó el identificador de Siigo de este documento."
+    headers, err = get_siigo_headers(tenant_nit, siigo_user, siigo_key)
+    if not headers: return False, f"No se pudo conectar con Siigo ({err})."
+    base = "https://api.siigo.com/v1/purchase-support-documents" if tipo == "DS" else "https://api.siigo.com/v1/purchases"
+    try: r = requests.delete(f"{base}/{siigo_id}", headers=headers, timeout=20)
+    except Exception as e: return False, f"Error de red: {e}"
+    if r.status_code in (200, 202, 204): return True, f"Siigo respondió {r.status_code}."
+    return False, f"Siigo respondió {r.status_code}: {r.text[:400]}"
+
 def causar_en_siigo_api(payload, is_ds, tenant_nit, siigo_user, siigo_key):
     headers, err = get_siigo_headers(tenant_nit, siigo_user, siigo_key)
     if not headers: return False, f"No Token: {err}", None, None, None
@@ -1908,9 +1919,10 @@ def modal_anular_causacion(hist_record, tenant_nit, siigo_user, siigo_key, curr_
     kk = tipo + "_" + re.sub(r'\W', '', ref) + "_" + re.sub(r'\D', '', str(hist_record["nit"]))
     st.markdown(f"**{tipo}-{ref}** · {hist_record['proveedor']}")
     st.caption(f"En Siigo: {num_siigo or 'sin número guardado'}")
-    st.info("Esto **limpia la factura en AutoCount** (Histórico y Tesorería) y la devuelve para causarla de nuevo. **No borra nada en Siigo**: la factura tiene que estar borrada allá primero, y la app lo verifica.")
+    st.info("Esto **limpia la factura en AutoCount** (Histórico y Tesorería) y la devuelve para causarla de nuevo. **La anulación en sí no borra nada en Siigo**: la factura tiene que estar borrada allá primero (a mano o con el botón de borrar de abajo), y la app lo verifica.")
 
     caja_estado = st.container()
+    if st.session_state.get(f"anul_delmsg_{kk}"): st.success(st.session_state.pop(f"anul_delmsg_{kk}"))
     ck = f"anul_chk_{kk}"
     if st.button("🔄 Verificar de nuevo en Siigo", key=f"anul_redo_{kk}"): st.session_state.pop(ck, None)
     if ck not in st.session_state or (time.time() - st.session_state[ck][2]) > 60:
@@ -1921,7 +1933,18 @@ def modal_anular_causacion(hist_record, tenant_nit, siigo_user, siigo_key, curr_
     confirmado_manual = False
     with caja_estado:
         if estado_siigo == "existe":
-            st.error("🔴 Esta factura **todavía existe en Siigo**. Bórrala allá primero y luego pulsa «Verificar de nuevo».")
+            st.error("🔴 Esta factura **todavía existe en Siigo**. Bórrala allá primero y luego pulsa «Verificar de nuevo», o intenta borrarla desde aquí.")
+            with st.expander("🗑️ Intentar borrarla en Siigo desde aquí", expanded=False):
+                st.caption("Siigo decide si lo permite (por ejemplo, no deja si tiene pagos u otros movimientos relacionados). Si lo rechaza, no se cambia nada y verás su respuesta.")
+                ok_borrar = st.checkbox("Entiendo que esto BORRA la factura en Siigo", key=f"anul_delchk_{kk}")
+                if st.button("🗑️ Borrar en Siigo", key=f"anul_del_{kk}", disabled=not ok_borrar):
+                    with st.spinner("Pidiendo a Siigo que la borre..."):
+                        _ok_b, _msg_b = siigo_borrar_documento(id_siigo, tipo, tenant_nit, siigo_user, siigo_key)
+                    if _ok_b:
+                        st.session_state.pop(ck, None)
+                        st.session_state[f"anul_delmsg_{kk}"] = "✅ " + _msg_b
+                        st.rerun()
+                    else: st.error(f"❌ No se borró. {_msg_b}")
         elif estado_siigo == "no_existe":
             st.success("✅ Siigo confirma que la factura ya no existe. Se puede limpiar en AutoCount.")
         else:
@@ -3040,7 +3063,7 @@ elif panel_seleccionado == "📊 6. Tablero Audit (Ajustes)":
                 with c5:
                     if c["tipo"] == "FC":
                         if can_cause and st.button("⚖️ Ajuste CC (ReteICA)", key=f"btn_adj_ica_{c['id_doc_prov']}_{c['tipo']}", use_container_width=True): modal_ajuste_ica(c, maestros, curr_tenant.get('puc', DEFAULT_PUC), curr_tenant_nit, curr_tenant['siigo_user'], curr_tenant['siigo_key'], curr_user['email'])
-                    if can_admin and st.button("↩️ Anular causación", key=f"btn_anul_{idx}_{c['tipo']}_{c['id_doc_prov']}", use_container_width=True): modal_anular_causacion(c, curr_tenant_nit, curr_tenant['siigo_user'], curr_tenant['siigo_key'], curr_user['email'])
+                    if can_cause and st.button("↩️ Anular causación", key=f"btn_anul_{idx}_{c['tipo']}_{c['id_doc_prov']}", use_container_width=True): modal_anular_causacion(c, curr_tenant_nit, curr_tenant['siigo_user'], curr_tenant['siigo_key'], curr_user['email'])
 
 # ----------------------------------------------------
 # PANEL 7: REPORTES Y EXPORTACIONES
